@@ -28,6 +28,6 @@ dependencies = [
 Homepage = "https://github.com/Shivmahlan/dcleaner"
 Repository = "https://github.com/Shivmahlan/dcleaner"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["dclean*"]
+[tool.setuptools]
+packages = ["dclean"]
+py-modules = ["dcleaner"]
