@@ -47,6 +47,11 @@ Requirements: Python ≥ 3.8, plus `pandas`, `matplotlib`, and `numpy`
 A self-contained demo notebook lives at [`examples/demo.ipynb`](examples/demo.ipynb) —
 it generates its own data and walks through clean → filter → aggregate → plot.
 
+See the time saved side-by-side:
+[`examples/with_dcleaner.ipynb`](examples/with_dcleaner.ipynb) vs
+[`examples/without_dcleaner.ipynb`](examples/without_dcleaner.ipynb)
+(same task, raw pandas vs `dcleaner`).
+
 ---
 
 ## The idea
