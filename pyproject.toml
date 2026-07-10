@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcleaner"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fluent, low-boilerplate data cleaning and visualization on top of pandas."
 readme = "README.md"
 requires-python = ">=3.8"

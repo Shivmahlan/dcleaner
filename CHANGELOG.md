@@ -4,6 +4,13 @@ All notable changes to `dcleaner` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-07-10
+
+### Added
+- `import dcleaner` shim so both `import dcleaner` (then `dcleaner.Data`)
+  and `from dclean import Data` work, removing the pip-name/import-name
+  confusion.
+
 ## [0.1.0] - 2026-07-10
 
 ### Added
