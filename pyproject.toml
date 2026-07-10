@@ -25,8 +25,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/shiv/dclean"
-Repository = "https://github.com/shiv/dclean"
+Homepage = "https://github.com/Shivmahlan/dcleaner"
+Repository = "https://github.com/Shivmahlan/dcleaner"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -8,7 +8,7 @@ API so a full **load → clean → filter → aggregate → plot** pipeline is o
 expression. It is a thin, fluent layer over pandas — when you need the full
 power of pandas, call `.to_df()` and drop straight back into it.
 
-![CI](https://github.com/Shivmahlan/dclean/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/Shivmahlan/dcleaner/actions/workflows/ci.yml/badge.svg)
 
 ---
 
