@@ -4,6 +4,115 @@ All notable changes to `dcleaner` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-08-29
+
+### Changed - BREAKING
+- **Transforms no longer mutate in place.** Every transform (`dropna`, `filter`,
+  `mutate`, `to_float`, `agg`, `clean`, ...) now returns a **new** `Data`; the
+  object you called it on is left exactly as it was. Previously `d.dropna()`
+  modified `d` itself, so `clean = raw.dropna()` silently changed `raw` too —
+  the opposite of the pandas contract and a real source of wrong results.
+  Chained pipelines are unaffected; statement-style calls must now bind the
+  result (`d = d.to_float("price")`).
+- Inspect (`head`, `report`, `nulls`, ...), plot and output methods still return
+  the same object, since they change no data. The rule is documented in the
+  README's "Transforms never mutate" table.
+
+### Added
+- **`clean()` — one-call auto-clean.** Normalizes column names, drops all-empty
+  rows/columns, trims whitespace, converts `""`/`"n/a"`/`"null"` to real NaN,
+  coerces numeric-looking text to numbers (currency symbols and thousands
+  separators included: `"$1,234.50"` → `1234.5`), parses date-looking columns to
+  datetimes, removes duplicates, and handles nulls via
+  `nulls="keep"|"drop"|"fill"`. Prints a report of every action taken.
+- **`report()` — one-call data profile.** Per-column dtype, null count and
+  percentage, unique count and an example value, plus duplicate-row count,
+  numeric summary stats and data-quality warnings (constant columns, mostly-null
+  columns, numbers stored as text, ID-like columns).
+- **Module-level helpers** so the whole job is a single call:
+  `dclean.clean(src, to="out.csv")`, `dclean.report(src)`, `dclean.load(src)`.
+  Also exported from the `dcleaner` shim.
+- `fix_nulls([strategy], [subset])` — fills missing values without you choosing a
+  statistic per column (`auto`/`mean`/`median`/`mode`/`zero`/`ffill`).
+- `drop_outliers([cols], [method], [factor])` — IQR (default) or z-score.
+- `log()` / `steps()` — replay the pipeline that produced the current frame, so
+  the toolkit's automatic decisions stay auditable.
+- **One-call aggregates**, so the common questions cost one call instead of two:
+  `mean/sum/count/median/min/max([col], [by])`, plus `top(n, by)`,
+  `bottom(n, by)` and `counts(col)` (frequency table). All share one `stat()`
+  engine; `.groupby().agg()` still works and returns identical results.
+- `plot()` infers `x` and `y` on a two-column frame — what a grouped aggregate
+  leaves you with — so `.mean("price", by="city").plot("bar")` needs no axes.
+- `Data.samples()` — list the datasets bundled with the package.
+- `copy()` — an explicit independent copy.
+
+### Fixed
+- **The bundled sample dataset now actually ships.** `dclean/data/sample_sales.csv`
+  was declared in packaging and promised in the README since 0.1.3 but was never
+  committed, so the README's headline example raised `FileNotFoundError` after a
+  fresh `pip install`. The dataset is deliberately messy (padded column names,
+  `$1,234.50` prices, `"n/a"` values, an all-empty column, duplicate rows) so
+  `clean()` and `report()` have something to demonstrate.
+  Root cause: `.gitignore` ignored `*.csv` with an exception only for
+  `tests/data/`, so `git add` silently skipped the file. `dclean/data/*.csv` is
+  now excepted too, which is what let the file go missing for four releases.
+- `describe()` no longer raises `KeyError: 'mean'` on frames with no numeric
+  columns; it falls back to pandas' object summary.
+- `to_float()` strips currency symbols, thousands separators and parenthesized
+  negatives before coercing, so `"$1,234.50"` and `"(500)"` parse correctly
+  instead of becoming NaN.
+- `filter()`'s `query()` fallback returned a DataFrame where the caller expected
+  a boolean mask; the result is now handled correctly either way.
+- Bundled-sample lookup used `os.sep`, which missed `/`-style paths on Windows;
+  it now uses `os.path.dirname`.
+- `mutate()` accepts accessor expressions such as
+  `mutate(city="city.str.strip().str.lower()")`; `DataFrame.eval` cannot parse
+  those, and it previously raised `ValueError: unknown type object`, forcing a
+  `.to_df()` escape for any string operation.
+- `drop_outliers(method="zscore")` dropped **every** row when a column had no
+  spread (a constant column gave `std == 0`, which the guard treated as "keep
+  nothing"). Columns with no spread are now skipped - they contain no outliers.
+- Whole-frame stats (`mean()`, `sum()`, ... with no column) raised `TypeError`
+  when any text column was present; they now aggregate numeric columns only.
+- `plot()`'s inferred axes put the only numeric column on `x` for a one-column
+  frame, leaving nothing to chart; `y` is now always the value column. A frame
+  with no numeric column raises an explanatory error instead of a bare pandas
+  `TypeError`.
+- `fix_nulls()` silently fell back to the median on an unrecognized strategy;
+  it now raises `ValueError` listing the valid ones.
+- **`clean()` no longer destroys values silently.** A column converts to numeric
+  when >90% of its values parse, so up to 10% of real values could become NaN
+  with no mention of it — on a column of amounts holding "pending"/"refunded",
+  those values simply disappeared. Both the numeric and date coercion steps now
+  count and report what they could not parse.
+- `report(examples=False)` shows value *types* instead of real cell values, for
+  profiling data containing anything personal without echoing it to stdout.
+- `filter()` / `mutate()` reject expressions containing `__`. These methods
+  execute their argument, so the string must come from the developer; this
+  blocks the usual escape out of a restricted namespace. A guard rail, not a
+  sandbox — see the README's "Using it on real data".
+- Replaced a `str.removeprefix` call, which is Python 3.9+ and would have failed
+  the 3.8 leg of CI.
+- `nulls()` now reports a percentage alongside each count.
+
+### Docs
+- README gains a **Command reference** section listing every command grouped by
+  task, and a **Transforms never mutate** section explaining the return-value
+  rule.
+- All three example notebooks rewritten against the bundled dataset (they used
+  to synthesize their own) and updated for the new API. `with_dcleaner.ipynb`
+  and `without_dcleaner.ipynb` now perform the *same* cleaning work, so the
+  comparison is honest: one call versus ~25 lines, verified to produce
+  identical frames.
+
+## [0.1.6] - 2026-07-19
+
+### Added
+- `dtypes()` — print each feature's data type.
+- `print([n])` — print the dataset itself, chainable.
+- `shape()` now also prints the column list and per-column dtypes.
+- `print(d)` renders the dataset table (`__str__`); `repr(d)` stays terse.
+
 ## [0.1.5] - 2026-07-19
 
 ### Added

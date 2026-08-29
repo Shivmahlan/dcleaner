@@ -7,7 +7,9 @@ dist/
 .pytest_cache/
 *.png
 *.csv
+# ...but the bundled sample dataset and test fixtures must ship
 !tests/data/*.csv
+!dclean/data/*.csv
 .venv/
 venv/
 .DS_Store
