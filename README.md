@@ -16,6 +16,7 @@ drops you back into full pandas whenever you outgrow the wrapper.
 ![CI](https://github.com/Shivmahlan/dcleaner/actions/workflows/ci.yml/badge.svg)
 [![PyPI version](https://img.shields.io/pypi/v/dcleaner.svg)](https://pypi.org/project/dcleaner/)
 [![OpenSSF Best Practices](https://img.shields.io/badge/OpenSSF-baseline-blue)](https://www.bestpractices.dev/)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Shivmahlan/dcleaner/blob/main/examples/demo.ipynb)
 
 ---
 
@@ -25,16 +26,19 @@ drops you back into full pandas whenever you outgrow the wrapper.
 - [The idea](#the-idea)
 - [Quick start](#quick-start)
 - [The toolkit: just tell it](#the-toolkit-just-tell-it)
+- [From the shell](#from-the-shell)
 - [Transforms never mutate](#transforms-never-mutate)
 - [Loading data](#loading-data)
 - [Inspecting](#inspecting)
 - [Cleaning](#cleaning)
 - [Filtering](#filtering)
 - [Transforming](#transforming)
+- [Combining tables](#combining-tables)
 - [Aggregating](#aggregating)
 - [Correlations](#correlations)
 - [Plotting](#plotting)
 - [Exporting](#exporting)
+- [Recipes](#recipes)
 - [Command reference](#command-reference)
 - [Full API reference](#full-api-reference)
 - [Why not just use pandas?](#why-not-just-use-pandas)
@@ -65,7 +69,8 @@ dclean.clean("sample_sales.csv")      # fix it
 ```
 
 [`examples/demo.ipynb`](examples/demo.ipynb) walks the whole toolkit:
-profile → clean → aggregate → plot.
+profile → clean → aggregate → plot. Run it without installing anything:
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Shivmahlan/dcleaner/blob/main/examples/demo.ipynb)
 
 See the time saved side-by-side:
 [`examples/with_dcleaner.ipynb`](examples/with_dcleaner.ipynb) vs
@@ -99,7 +104,7 @@ result = (Data("sample_sales.csv")
     .filter("units > 5 and city in ['SF', 'Chicago']")
     .groupby("city").agg("mean", "unit_price")
     .plot("bar", x="city", y="unit_price", title="Mean price by city")
-    .savefig("price_by_city.png"))
+    .show())          # the chart opens right here - no PNG to go and find
 ```
 
 The `.clean()` step alone is the part you would otherwise write by hand every
@@ -113,13 +118,13 @@ dropping the empty column, killing duplicates.
 ```python
 from dclean import Data
 
-# Load, clean, filter, aggregate, plot, save — in one chain.
+# Load, clean, filter, aggregate, plot — in one chain.
 (Data("sales.csv")
     .dropna()
     .filter("age > 18")
     .groupby("city").agg("mean", "salary")
     .plot("bar", x="city", y="salary")
-    .savefig("salary.png"))
+    .show())
 ```
 
 ---
@@ -187,6 +192,19 @@ warnings
   ! 'Legacy Column' is entirely empty
 ```
 
+**Send it to someone.** `to=` writes the same profile as a single HTML file —
+styles inline, nothing loaded from a CDN — so it opens anywhere: attached to a
+ticket, emailed, or dropped in a shared folder.
+
+```python
+Data("sales.csv").report(to="profile.html")
+Data("sales.csv").report(examples=False, to="profile.html")   # no real values
+```
+
+`examples=False` matters more here than in the terminal: the HTML file is the
+one somebody else ends up holding, so that flag keeps your actual data out of
+it — the column shows `<str>` / `<int64>` instead.
+
 ### One call per idea
 
 Common questions shouldn't cost you two calls and a dummy column:
@@ -205,7 +223,7 @@ d.median("price"); d.min("price"); d.max("price")   # whole-frame too
 straight away:
 
 ```python
-(Data("sales.csv").clean().mean("price", by="city").plot("bar").savefig("out.png"))
+(Data("sales.csv").clean().mean("price", by="city").plot("bar").show())
 ```
 
 The longhand `.groupby().agg()` still works and returns identical results —
@@ -249,6 +267,50 @@ units, an empty column, duplicate rows — so `clean()` has something to do.
 
 ---
 
+## From the shell
+
+Some jobs never need a Python session. `pip install dcleaner` puts a `dcleaner`
+command on your PATH, and every subcommand is a thin wrapper over the API of
+the same name — so the terminal and the library can never disagree about what
+"clean" means.
+
+```bash
+dcleaner report sales.csv                        # full data-quality profile
+dcleaner report sales.csv --no-examples          # ...with no real values in it
+dcleaner report sales.csv --html profile.html    # ...as a shareable HTML file
+
+dcleaner clean messy.csv                         # clean it, say what changed
+dcleaner clean messy.csv -o clean.csv            # ...and write it out
+dcleaner clean messy.csv -o clean.parquet --nulls fill -q
+
+dcleaner head sales.csv -n 20                    # peek at the first 20 rows
+dcleaner --version
+```
+
+| Command | Flags |
+|---|---|
+| `dcleaner report FILE` | `--no-examples` (show types, not your values) · `--html OUT` (self-contained file) |
+| `dcleaner clean FILE` | `-o/--out OUT` (csv/xlsx/json/parquet) · `--nulls keep\|drop\|fill` · `--no-dates` · `-q/--quiet` |
+| `dcleaner head FILE` | `-n N` (default 5) |
+
+It behaves like a shell tool should: **exit 0** on success, **exit 1** with one
+line on stderr for anything you can fix — a missing file, a file type `dclean`
+doesn't read, an output extension it can't write. A traceback means a bug in
+`dclean`, not a typo in a filename.
+
+```bash
+$ dcleaner report nope.csv
+dcleaner: no such file: nope.csv
+$ echo $?
+1
+```
+
+Piped output is plain text — the bold/underline escapes are dropped
+automatically when stdout isn't a terminal, so `dcleaner report x.csv > profile.txt`
+gives you a clean file. `NO_COLOR` and `FORCE_COLOR` are both respected.
+
+---
+
 ## Transforms never mutate
 
 **Every transform returns a new `Data`. The object you called it on is never
@@ -272,17 +334,31 @@ as before, because each step passes its new object to the next:
     .filter("units > 5")
     .groupby("city").agg("mean", "unit_price")
     .plot("bar", x="city", y="unit_price")
-    .savefig("out.png"))
+    .show())
 ```
 
 The rule is simple:
 
 | Kind of method | Returns |
 |---|---|
-| Transforms — `clean` `dropna` `filter` `mutate` `agg` `to_float` … | a **new** `Data` |
+| Transforms — `clean` `dropna` `filter` `mutate` `agg` `join` `concat` … | a **new** `Data` |
 | Inspectors — `head` `report` `nulls` `describe` `log` … | the **same** object (they change nothing) |
-| Plot / output — `plot` `savefig` `to_csv` `show` | the **same** object |
-| Escape hatches — `to_df` `steps` `len` `repr` | a plain value |
+| Plot / output — `plot` `savefig` `to_csv` `to_excel` `to_json` `to_parquet` `save_recipe` `show` | the **same** object |
+| Escape hatches — `to_df` `to_fig` `steps` `len` `repr` | a plain value |
+
+**Type hints ship with the package.** `dclean` includes a `py.typed` marker, so
+`mypy`, `pyright` and your editor read the annotations on the public API
+straight from the installed package — no stub package, no `# type: ignore`:
+
+```python
+d: Data = Data("sales.csv").clean()     # -> Data
+df: pd.DataFrame = d.to_df()            # -> DataFrame, the escape hatch
+names: List[str] = d.steps()            # -> List[str]
+```
+
+Transforms are annotated as returning `Data`, inspectors and output methods the
+same, and the escape hatches their real types — the contract in the table above,
+enforced by your checker.
 
 > **Upgrading from 0.1.x?** Transforms used to modify in place, so
 > `d.to_float("price")` worked as a statement. Now you must bind the result:
@@ -315,6 +391,7 @@ Data.from_records([{"name": "a", "val": 1}, {"name": "b", "val": 2}])
 
 ```python
 d = Data("sales.csv")
+d                   # in a notebook: renders as a table (see below)
 d.head()            # first 5 rows
 d.head(10)          # first 10 rows
 d.tail()            # last 5 rows
@@ -329,7 +406,57 @@ d.info()            # pandas .info()  (incl. per-column dtypes)
 d.describe()        # highlighted summary stats of numeric columns
 d.nulls()           # missing-value counts per column (+ total)
 d.report()          # FULL profile: dtypes, nulls, dupes, stats, warnings
+d.report(to="p.html")  # ...the same profile as one shareable HTML file
 d.log()             # the pipeline steps that produced this frame
+```
+
+### In a notebook
+
+A bare `Data` at the end of a cell now renders as a real table — a header line
+with the shape, then the first 10 rows — instead of the one-line repr:
+
+```python
+d = Data("sales.csv")
+d
+```
+
+> **dclean.Data** — 60 rows × 4 cols — showing the first 10
+>
+> | | city | age | salary | score |
+> |---|---|---|---|---|
+> | **0** | NY | 56.0 | NaN | 54.807467 |
+> | **1** | SF | 48.0 | NaN | 54.465312 |
+> | **…** | | | | |
+
+The terminal is deliberately unchanged — `repr()` stays terse and `print()`
+still prints the whole table, so nothing about scripts or the REPL moved:
+
+```python
+>>> repr(d)
+'dclean.Data(60x4, cols=[city, age, salary, score])'
+>>> print(d)          # still the full table
+```
+
+### Output you can pipe
+
+Headings are bold and underlined on a terminal and **plain text everywhere
+else**, so a redirected report is a clean file rather than one full of
+`\033[1m`:
+
+```bash
+python analysis.py                    # bold headings on screen
+python analysis.py > profile.txt      # plain text in the file
+dcleaner report sales.csv | less      # plain text through the pipe
+```
+
+The decision is made **once, when `dclean` is imported**, from wherever stdout
+points at that moment — so it costs nothing per print. Both standard overrides
+are honoured:
+
+```bash
+NO_COLOR=1 dcleaner report sales.csv            # never colour, even on a terminal
+FORCE_COLOR=1 dcleaner report sales.csv | less -R   # colour anyway, through a pipe
+FORCE_COLOR=0 dcleaner report sales.csv         # force it off
 ```
 
 ---
@@ -428,6 +555,96 @@ d.sort("price", ascending=False)
 
 ---
 
+## Combining tables
+
+### `join()` — attach another table, and see what actually matched
+
+```python
+d.join("regions.csv", on="city")                  # left join (the default)
+d.join(other, on=["city", "year"], how="inner")   # multi-column key
+d.join(other, left_on="city_id", right_on="id")   # the two sides spell it differently
+```
+
+`other` is a `Data`, a DataFrame or a path. `on` defaults to the columns the two
+tables share. `how` is `left` (default), `inner`, `right` or `outer`.
+
+**The report is the feature.** A join where one side says `"SF "` and the other
+says `"SF"` matches nothing, tells you nothing, and quietly poisons every number
+downstream. So `join()` counts what matched before it merges:
+
+```
+JOIN
+  + left join on 'city'
+  + 2 of 4 left rows matched, 2 of 5 right rows used
+  ! 2 rows on the left matched nothing (kept, with nulls): 'SF ', 'chicago'
+  ! 2 of those keys match after case/whitespace folding - .clean() both sides before joining
+  ! 3 rows on the right matched nothing (dropped)
+  + right columns kept under a suffix: notes_right
+-> 4x3 to 4x5
+```
+
+Every line there is a bug people actually ship: keys that miss, keys that would
+match after a `.clean()`, rows silently dropped by an `inner` join, and — the
+one that inflates totals without changing the row count you were watching — a
+non-unique key on the right:
+
+```
+  ! the right key is not unique - the join added 340 rows
+```
+
+A join that *cannot* work is refused up front rather than returning an empty
+frame:
+
+```python
+d.join(other, on="id")
+# ValueError: join key 'id' is text on the left but 'id' is number on the right
+# - they can never match. Make them agree first, e.g. .to_float('id')
+```
+
+Overlapping non-key columns keep their name on the left; the right-hand one
+gets a suffix (`suffix="_right"` by default). `verbose=False` skips the report —
+and the counting work with it, so a join inside a loop costs no more than
+`pd.merge`.
+
+### `concat()` — stack tables on top of each other
+
+```python
+Data.concat("data/2024-*.csv")                       # a whole folder of files
+Data.concat("jan.csv", "feb.csv", source_col="file") # tag each row with its file
+Data.concat([d1, d2, df3])                           # Data, DataFrames, paths
+d.concat(more)                                       # onto an existing Data
+```
+
+Columns are matched by name, and the report calls out the two things that
+quietly ruin a stacked dataset — a column missing from one source (it silently
+becomes nulls) and a column whose type changes between sources:
+
+```
+CONCAT
+  + 2 sources: m_2024-01.csv (1 row), m_2024-02.csv (1 row)
+  ! 'notes' is missing from m_2024-02.csv - those rows are null there
+  ! 'extra' is missing from m_2024-01.csv - those rows are null there
+  + tagged every row with its source in 'file'
+-> 2x5
+```
+
+`source_col` is worth the extra column the moment two files disagree — it is the
+difference between "some rows are wrong" and "the February export is wrong".
+
+### The whole job, end to end
+
+```python
+(Data.concat("exports/*.csv", source_col="file")   # every monthly export
+    .clean()                                       # names, types, dates, dupes
+    .join("regions.csv", on="city")                # attach the lookup table
+    .filter("units > 5")
+    .sum("revenue", by="region")
+    .plot("bar", title="Revenue by region")
+    .show())
+```
+
+---
+
 ## Aggregating
 
 Group then aggregate. `agg(how, col)` computes one statistic on one column.
@@ -471,7 +688,7 @@ print(corr_df)
 (Data("sales.csv")
     .dropna()
     .plot_corr(title="Feature correlations")
-    .savefig("corr.png"))
+    .show())
 ```
 
 `corr()` and `plot_corr()` use Pearson correlation on numeric columns only.
@@ -494,15 +711,80 @@ d.plot("box",    x="city",   y="salary")               # boxplot
 d.plot("pie",    x="city",   y="salary")               # pie chart
 ```
 
-Finish a plot with `.savefig("path.png")` (saves the figure) or `.show()`
-(opens it interactively — in notebooks this renders inline).
+### Colours you can actually tell apart
+
+Around 1 in 12 men cannot separate matplotlib's default red from its green, so
+`dclean` doesn't draw with them. Charts use the **Okabe-Ito** qualitative set —
+eight hues chosen to stay distinct under the common colour-vision deficiencies,
+and still separable in greyscale when someone prints it:
 
 ```python
+d.plot("bar", x="city", y="salary")     # first series is #0072B2, then #E69F00, ...
+```
+
+`plot_corr()` uses a **diverging** map (`RdBu_r` — blue/red, never red/green)
+pinned to `-1..+1`, so the neutral colour always means *no correlation*. On an
+auto-scaled heatmap the midpoint lands wherever the data happens to sit, which
+reads as a lie:
+
+```python
+d.plot_corr()                       # blue = negative, red = positive, white = 0
+```
+
+Both are **defaults, not decisions** — anything you pass wins:
+
+```python
+d.plot("bar", x="city", y="salary", color="red")     # your colour
+d.plot("line", x="date", y="revenue", colormap="viridis")
+d.plot_corr(cmap="coolwarm")                         # the old default, if you liked it
+```
+
+The palette is scoped to the call, so importing `dclean` changes nothing about
+any other plotting you do in the same session.
+
+### Where the chart appears
+
+The plot shows up where you are working — you never have to open a PNG to see
+what you just plotted:
+
+| Where you run it | What happens |
+|---|---|
+| Jupyter / IPython notebook | renders **inline**, in the same cell, as soon as you call `.plot()` |
+| Script or REPL | end the chain with `.show()` (or pass `show=True`) and it opens in a window |
+| No display at all (CI, a server over SSH) | `.savefig("chart.png")` writes the file; `.show()` tells you there is no display instead of silently doing nothing |
+
+```python
+# notebook - the bar chart appears under the cell, no savefig needed
+(Data("sales.csv")
+    .dropna()
+    .groupby("city").agg("mean", "salary")
+    .plot("bar", x="city", y="salary", title="Mean salary by city"))
+
+# script - .show() opens the window
 (Data("sales.csv")
     .dropna()
     .groupby("city").agg("mean", "salary")
     .plot("bar", x="city", y="salary", title="Mean salary by city")
-    .savefig("salary_by_city.png"))
+    .show())
+
+# want the file as well? savefig still does exactly what it always did
+d.plot("bar", x="city", y="salary").savefig("salary_by_city.png")
+```
+
+`show=` overrides the automatic choice on `plot()`, `plot_corr()` and
+`nulls(plot=True)`:
+
+```python
+d.plot("bar", show=True)     # display it now, wherever I am
+d.plot("bar", show=False)    # display nothing; I only want .savefig()
+```
+
+`.to_fig()` hands back the matplotlib `Figure` — the plotting equivalent of
+`.to_df()` — for anything `dclean` doesn't wrap:
+
+```python
+fig = d.plot("bar").to_fig()
+fig.axes[0].set_ylabel("mean salary ($)")
 ```
 
 Extra matplotlib keyword arguments pass straight through:
@@ -511,21 +793,114 @@ Extra matplotlib keyword arguments pass straight through:
 d.plot("scatter", x="age", y="salary", color="red", alpha=0.5)
 ```
 
-> Note: because `dclean` sets a headless-safe matplotlib backend, `savefig`
-> always works (e.g. in scripts, CI, servers). `show()` is for interactive use.
+> Note: `dclean` does not pin a matplotlib backend, so plots render inline in
+> notebooks and in a window from a script. Matplotlib's own detection still
+> falls back to a file-only backend when there is no display, so `savefig()`
+> keeps working in scripts, CI and servers.
 
 ---
 
 ## Exporting
 
+`dclean` writes back every format it reads:
+
 ```python
 d.to_csv("cleaned.csv")          # write the current frame, no index
+d.to_excel("cleaned.xlsx")       # needs: pip install openpyxl
+d.to_json("cleaned.json")        # records + ISO-8601 dates by default
+d.to_parquet("cleaned.parquet")  # needs: pip install pyarrow
+```
+
+All four return the **same** object, so an export can sit mid-chain:
+
+```python
+(Data("messy.csv")
+ .clean()
+ .to_csv("clean.csv")            # snapshot the cleaned data...
+ .filter("units > 5")            # ...and carry on
+ .to_parquet("big_orders.parquet"))
+```
+
+`openpyxl` and `pyarrow` are **not** installed with `dcleaner` — they are
+imported only when you call the method that needs one, and the error tells you
+the exact `pip install` if it is missing.
+
+```python
 raw = d.to_df()                  # get the raw pandas DataFrame back
 raw.describe()                   # now use any pandas method you like
 ```
 
 `.to_df()` is the escape hatch: `dclean` never hides pandas from you. Use it
 for anything `dclean` doesn't wrap yet.
+
+---
+
+## Recipes
+
+You cleaned January. February is the same file with different rows — and next
+month there'll be another one. A **recipe** saves what your pipeline did so you
+can run it again on a different file:
+
+```python
+Data("jan.csv").clean().filter("units > 5").save_recipe("monthly.json")
+Data("feb.csv").apply_recipe("monthly.json")
+```
+
+`save_recipe()` is an output method (writes the file, returns the same object);
+`apply_recipe()` is a transform (returns a **new** `Data`). The replayed steps
+land in the new object's own `.log()`, so provenance survives the round trip:
+
+```python
+Data("feb.csv").apply_recipe("monthly.json").log()
+```
+```
+pipeline
+  1. clean(nulls='keep')
+  2. filter('units > 5')
+```
+
+The file is plain, reviewable JSON — it belongs in git next to the code that
+uses it:
+
+```json
+{
+  "recipe": 1,
+  "dcleaner": "0.3.0",
+  "created": "2026-08-30T12:58:29",
+  "steps": [
+    {"method": "clean",  "args": [],              "kwargs": {"nulls": "keep", "dates": true},
+     "display": "clean(nulls='keep')"},
+    {"method": "filter", "args": ["units > 5"],   "kwargs": {},
+     "display": "filter('units > 5')"}
+  ]
+}
+```
+
+`display` is there for you to read in a diff — **replay never parses it**, only
+`method`/`args`/`kwargs`. That's the whole reason steps are recorded
+structurally instead of being reverse-engineered from the log: a column named
+`it's (a) column` would defeat any parser of dclean's own repr.
+
+**Not everything replays.** The whitelist is the transforms that are a pure
+function of the frame plus plain arguments. `join()` and `concat()` need a
+second table a recipe can't carry, and `groupby().agg()` is two calls — so
+`save_recipe()` **refuses** rather than quietly dropping the step:
+
+```python
+d.groupby("city").agg("mean", "salary").save_recipe("r.json")
+# ValueError: step 2 (groupby(['city']).agg('mean', 'salary')) cannot be
+# replayed - groupby().agg() is two calls - use .mean(col, by=...) ...
+```
+
+A recipe that silently skipped your join would hand you a different dataset
+without saying so. Use the one-call form (`.mean("salary", by="city")`), which
+records as a single step, or save the recipe before the join.
+
+> ⚠️ **A recipe is code.** `filter()` and `mutate()` steps are expressions that
+> get evaluated on replay, exactly as if you had typed them. A recipe file is
+> as trusted as a Python script — run the ones you wrote, not ones you were
+> sent. The whitelist is checked again at replay time (the file may have been
+> edited), so an unknown method is an error, never a silent skip.
 
 ---
 
@@ -569,7 +944,10 @@ d.info()                             # pandas .info()
 d.describe()                         # highlighted numeric summary
 d.nulls()         d.nulls(plot=True) # missing values per column (+ chart)
 d.report()                           # dtypes, nulls, dupes, stats, warnings
+d.report(to="profile.html")          # same profile, one self-contained file
 d.log()           d.steps()          # what this pipeline actually did
+d.save_recipe("r.json")              # save those steps...
+Data("feb.csv").apply_recipe("r.json")   # ...and replay them elsewhere
 print(d)          len(d)             # table render / row count
 ```
 
@@ -614,6 +992,21 @@ d.select("name", "price")
 d.sort("price")   d.sort("price", ascending=False)
 ```
 
+### Combine
+
+```python
+d.join("regions.csv", on="city")     # left join + a report of what matched
+d.join(other, on="city", how="inner")            # left/inner/right/outer
+d.join(other, on=["city", "year"])               # multi-column key
+d.join(other, left_on="city_id", right_on="id")  # differently named keys
+d.join(other, on="city", suffix="_lookup")       # rename right-hand clashes
+d.join(other, on="city", verbose=False)          # skip the report
+
+Data.concat("data/*.csv")            # stack a folder of files
+Data.concat("a.csv", "b.csv", source_col="file") # ...and record where each row came from
+d.concat(other)                      # stack onto an existing Data
+```
+
 ### Aggregate
 
 ```python
@@ -641,11 +1034,13 @@ d.plot("scatter", x="age", y="salary", color="red", alpha=0.5)
 d.plot("box", x="city", y="salary")
 d.plot("pie", x="city", y="salary")
 d.plot_corr(title="Feature correlations")
-d.savefig("chart.png")               # always works (headless-safe)
-d.show()                             # interactive / inline in notebooks
+d.plot("bar", show=False)            # build the figure, display nothing
+d.show()                             # inline in a notebook, a window from a script
+d.savefig("chart.png")               # write it to a file (works headless)
 
 d.to_csv("clean.csv")
 d.to_df()                            # the raw DataFrame - full pandas
+d.to_fig()                           # the matplotlib Figure - full matplotlib
 ```
 
 ---
@@ -654,18 +1049,19 @@ d.to_df()                            # the raw DataFrame - full pandas
 
 | Task | Method | Notes |
 |------|--------|-------|
-| **Do it all** | `dclean.clean(src, to=...)` `dclean.report(src)` `.clean([nulls])` `.report()` | one call: name the file, the library handles the rest |
+| **Do it all** | `dclean.clean(src, to=...)` `dclean.report(src)` `.clean([nulls])` `.report([examples], [to])` | one call: name the file, the library handles the rest; `report(to="x.html")` writes a shareable profile |
 | Load file | `Data("file.csv")` | auto-detects csv/xls/xlsx/json/parquet |
 | From frame | `Data(df)` / `Data.from_records([...])` | |
-| Inspect | `.head(n)` `.tail(n)` `.print([n])` `.to_table([max_rows])` `.shape()` `.dtypes()` `.cols()` `.info()` `.describe()` `.nulls([plot])` | `print(d)` renders the dataset; `repr(d)` stays terse. `.shape()` and `.dtypes()` show per-feature types |
+| Inspect | `.head(n)` `.tail(n)` `.print([n])` `.to_table([max_rows])` `.shape()` `.dtypes()` `.cols()` `.info()` `.describe()` `.nulls([plot], [show])` | `print(d)` renders the dataset; `repr(d)` stays terse. `.shape()` and `.dtypes()` show per-feature types |
 | Clean | `.clean([nulls])` `.dropna([subset])` `.fillna(v)` `.fix_nulls([strategy])` `.drop_outliers([cols])` `.dedupe([subset])` `.drop(c)` `.keep(*c)` `.rename(a=b)` `.lower_cols()` `.astype(a="t")` `.to_float(*cols)` | `.to_float()` strips currency/separators, unparseable→NaN |
 | Filter | `.filter("expr")` | `== != > < >= <= and or in not in` + `between` |
 | Transform | `.mutate(x="expr")` `.select(*c)` `.sort(by, [ascending])` | |
+| Combine | `.join(other, [on], [how], [left_on], [right_on], [suffix])` `Data.concat(*sources, [source_col])` | reports matched/unmatched rows, near-miss keys, row multiplication, column and type mismatches |
 | Aggregate | `.mean/.sum/.count/.median/.min/.max([col], [by])` `.top(n, by)` `.bottom(n, by)` `.counts(col)` `.stat(how, col, by)` | one call, no separate `groupby` step |
 | Aggregate (longhand) | `.groupby(*c).agg(how, col)` `.summarize(**stats)` `.corr([method])` | |
-| Plot | `.plot(kind, [x], [y], [title])` `.plot_corr([title])` | line/bar/hist/scatter/box/pie; `x`/`y` inferred on a 2-column frame |
-| Output | `.savefig(path)` `.show()` `.to_csv(path)` `.to_df()` | |
-| Provenance | `.log()` `.steps()` | what the pipeline actually did |
+| Plot | `.plot(kind, [x], [y], [title], [show])` `.plot_corr([title], [show])` | line/bar/hist/scatter/box/pie; `x`/`y` inferred on a 2-column frame; `show=` overrides where it renders |
+| Output | `.show()` `.savefig(path)` `.to_csv(path)` `.to_excel(path)` `.to_json(path)` `.to_parquet(path)` `.to_df()` `.to_fig()` | `.show()`/`.plot()` render inline in notebooks, in a window from a script; `to_excel`/`to_parquet` need `openpyxl`/`pyarrow` |
+| Provenance | `.log()` `.steps()` `.save_recipe(path)` `.apply_recipe(path)` | what the pipeline did — and running it again on another file |
 
 Transform methods return a **new** `Data` (the original is untouched);
 inspect, plot and output methods return the **same** object; `.to_df()`,
@@ -701,8 +1097,9 @@ shorter.
 - **Auditable.** `.log()` replays every step the toolkit took on your behalf.
 - **Vectorized.** `filter()` and `mutate()` use `DataFrame.eval`/`query`, so
   they stay fast on large frames — no Python-row loops.
-- **Headless-safe plotting.** The matplotlib backend is set to `Agg`, so
-  `savefig()` works in scripts, CI, and servers without a display.
+- **Plots where you are.** No backend is pinned: charts render inline in a
+  notebook and in a window from a script, and fall back to `savefig()` on a
+  machine with no display — so seeing a plot never costs a file round-trip.
 - **Escape hatch.** `.to_df()` gives you the raw DataFrame for anything not
   wrapped.
 
@@ -745,6 +1142,7 @@ you want locally and exactly what you don't want in a shared log. Pass
 
 ```python
 d.report(examples=False)    # example column shows <str>, <int64>, ...
+d.report(examples=False, to="profile.html")   # ...and in the shareable file
 ```
 
 ---

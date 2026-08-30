@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dcleaner"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fluent, low-boilerplate data cleaning and visualization on top of pandas."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -25,6 +25,9 @@ dependencies = [
     "tabulate>=0.8",
 ]
 
+[project.scripts]
+dcleaner = "dclean.cli:main"
+
 [project.urls]
 Homepage = "https://github.com/Shivmahlan/dcleaner"
 Repository = "https://github.com/Shivmahlan/dcleaner"
@@ -35,4 +38,5 @@ py-modules = ["dcleaner"]
 include-package-data = true
 
 [tool.setuptools.package-data]
+dclean = ["py.typed"]
 "dclean.data" = ["*.csv"]

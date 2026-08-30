@@ -1,10 +1,19 @@
 """Core fluent DataFrame wrapper for dclean."""
+import contextlib
+import datetime
+import functools
+import glob
+import importlib
+import json
 import os
 import re
+import sys
+from html import escape as _escape
+from typing import Any, List, Optional, Union
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # headless-safe; plots still save/show in notebooks
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 
 # Show every column (no "..." truncation) on any raw pandas print.
 pd.set_option("display.max_columns", None)
@@ -18,9 +27,33 @@ except ImportError:  # pragma: no cover - optional dependency
         showindex = kwargs.get("showindex", True)
         return df.to_string(index=bool(showindex))
 
-BOLD = "\033[1m"
-UNDER = "\033[4m"
-RESET = "\033[0m"
+# ----------------------------------------------------------------------- COLOR
+# Escape codes are for a terminal that can render them. Redirected into a file,
+# a pager or a CI log they are noise wrapped around every heading, so resolve
+# them once at import: FORCE_COLOR wins, then NO_COLOR (no-color.org), then the
+# honest question - is stdout actually a terminal?
+def _color_enabled(stream=None):
+    """True when it is safe to emit ANSI escapes on ``stream``."""
+    force = os.environ.get("FORCE_COLOR")
+    if force is not None:
+        return force != "0"
+    if os.environ.get("NO_COLOR"):
+        return False
+    stream = sys.stdout if stream is None else stream
+    try:
+        return bool(stream.isatty())
+    except Exception:  # pragma: no cover - a stream with no isatty()
+        return False
+
+
+def _resolve_colors(stream=None):
+    """``(BOLD, UNDER, RESET)`` for this environment - all empty when plain."""
+    if _color_enabled(stream):
+        return "\033[1m", "\033[4m", "\033[0m"
+    return "", "", ""
+
+
+BOLD, UNDER, RESET = _resolve_colors()
 
 # Values that mean "missing" in real-world exports but read as text.
 NA_TOKENS = {"", "na", "n/a", "n.a.", "nan", "null", "none", "-", "--", "?", "unknown"}
@@ -29,6 +62,175 @@ _DATEISH = re.compile(
     r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}"      # 2025-01-31 / 2025/1/31
     r"|^\s*\d{1,2}[-/]\d{1,2}[-/]\d{2,4}"   # 31-01-2025 / 1/31/25
 )
+
+
+# --------------------------------------------------------------------- DISPLAY
+# A plot should appear where you are working - inline in a notebook, in a window
+# from a script or REPL - not as a PNG you have to go and open. dclean therefore
+# pins no backend: it only fills in the one matplotlib cannot guess for itself
+# (a Jupyter kernel) and leaves matplotlib's own detection - which already falls
+# back to Agg when there is no display - alone everywhere else.
+_NON_INTERACTIVE_BACKENDS = {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}
+_NOTEBOOK_BACKENDS = ("inline", "ipympl", "nbagg", "widget")
+
+
+def _in_jupyter():
+    """True inside a Jupyter/IPython kernel (not a plain terminal IPython)."""
+    try:
+        shell = sys.modules["IPython"].get_ipython()
+    except (KeyError, AttributeError):  # pragma: no cover - IPython not installed
+        return False
+    return shell is not None and hasattr(shell, "kernel")
+
+
+def _backend_unset():
+    """True when nobody has told matplotlib which backend to use."""
+    try:
+        from matplotlib import rcsetup
+        return (dict.__getitem__(matplotlib.rcParams, "backend")
+                is rcsetup._auto_backend_sentinel)
+    except Exception:  # pragma: no cover - private API moved; assume "chosen"
+        return False
+
+
+def _autoselect_backend():
+    """Pick the inline backend in notebooks; never override an explicit choice."""
+    if os.environ.get("MPLBACKEND") or not _backend_unset():
+        return  # the user (or a test) asked for a specific backend - respect it
+    if _in_jupyter():
+        try:
+            matplotlib.use("module://matplotlib_inline.backend_inline")
+        except Exception:  # pragma: no cover - matplotlib_inline not installed
+            pass
+
+
+_autoselect_backend()
+
+
+def _display_mode():
+    """Where a figure can be shown: ``notebook``, ``gui`` or ``headless``."""
+    backend = matplotlib.get_backend().lower()
+    if any(k in backend for k in _NOTEBOOK_BACKENDS):
+        return "notebook"
+    if backend in _NON_INTERACTIVE_BACKENDS:
+        return "headless"
+    return "gui"
+
+
+def _render(fig, show):
+    """Put ``fig`` in front of the user, or hold it for later.
+
+    ``show=None`` means auto: render inline in a notebook, where it is free and
+    is exactly what you expect; stay quiet in a script, where popping a blocking
+    window mid-pipeline would hijack the run - call ``.show()`` there.
+    """
+    mode = _display_mode()
+    if show is None:
+        show = mode == "notebook"
+    if show and mode == "notebook":
+        try:
+            from IPython.display import display
+            display(fig)
+            plt.close(fig)  # shown already; stops the duplicate at end of cell
+        except ImportError:  # pragma: no cover - inline backend without IPython
+            plt.show()
+    elif show and mode == "gui":
+        plt.show()
+    elif show:
+        print("no display available (matplotlib backend "
+              f"'{matplotlib.get_backend()}') - save the plot instead: "
+              ".savefig('plot.png')")
+    elif mode == "notebook":
+        plt.close(fig)  # show=False means show=False, even in a notebook
+    return fig
+
+
+# A chart nobody can read is a chart that failed. Roughly 1 in 12 men cannot
+# separate matplotlib's default red from its green, so dclean draws with the
+# Okabe-Ito qualitative set - eight hues chosen to stay distinct under the
+# common colour-vision deficiencies, and in greyscale when it is printed.
+OKABE_ITO = ("#0072B2", "#E69F00", "#009E73", "#CC79A7",
+             "#56B4E9", "#D55E00", "#F0E442", "#000000")
+
+# Correlations run -1..+1, so the map has to diverge about zero and be equally
+# readable either side of it. RdBu_r is ColorBrewer's CVD-safe diverging pair
+# (blue/red, never red/green) with lightness symmetric about the midpoint -
+# unlike coolwarm, whose ends carry different perceived weight.
+DIVERGING = "RdBu_r"
+
+# If any of these were passed, the caller has chosen the colours themselves.
+_COLOR_KWARGS = ("color", "colors", "colormap", "cmap", "c", "style")
+
+
+def _palette(kwargs=None):
+    """Draw inside the Okabe-Ito cycle - unless the caller picked colours.
+
+    Scoped to the ``with`` block rather than set on the axes: pandas reads the
+    cycle from ``rcParams`` when it draws a bar or a pie, so an axes-level
+    cycle is silently ignored for exactly the chart types people use most. It
+    is a context manager rather than a global so importing dclean still changes
+    nothing about anybody else's plots.
+
+    A default is a default: an explicit ``color=`` / ``colormap=`` always wins.
+    """
+    if kwargs and any(k in kwargs for k in _COLOR_KWARGS):
+        return contextlib.nullcontext()
+    return plt.rc_context({"axes.prop_cycle": plt.cycler(color=list(OKABE_ITO))})
+
+
+def _listify(x):
+    """One column name or several -> a list of names."""
+    return list(x) if isinstance(x, (list, tuple)) else [x]
+
+
+def _dtype_kind(s):
+    """Coarse type of a Series: what has to agree for a join key to work."""
+    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+        return "number"
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return "date"
+    if pd.api.types.is_bool_dtype(s):
+        return "bool"
+    return "text"
+
+
+def _key_tuples(df, keys):
+    """Rows of ``keys`` as hashable tuples - for set membership on any key."""
+    return [tuple(row) for row in df[keys].astype(object).to_numpy()]
+
+
+def _folded_key_tuples(df, keys):
+    """Key tuples with case and padding removed - for near-miss diagnosis."""
+    folded = df[keys].astype(str).apply(lambda c: c.str.strip().str.lower())
+    return [tuple(row) for row in folded.to_numpy()]
+
+
+def _rows(n):
+    """`1 row` / `3 rows` - reports that read like English."""
+    return f"{n} row" + ("" if n == 1 else "s")
+
+
+def _fmt_keys(values, limit=3):
+    """`'SF ', 'chicago' (+2 more)` - a readable sample of key values."""
+    shown = [repr(v[0]) if len(v) == 1 else repr(tuple(v)) for v in values[:limit]]
+    more = len(values) - len(shown)
+    return ", ".join(shown) + (f" (+{more} more)" if more > 0 else "")
+
+
+class _classorinstance:
+    """A method that works both as ``Data.concat(...)`` and ``d.concat(...)``.
+
+    A plain ``classmethod`` called on an instance silently discards that
+    instance, so ``d.concat(other)`` would drop ``d``'s own rows - the wrong
+    answer, quietly. This passes the instance through (``None`` off the class).
+    """
+
+    def __init__(self, func):
+        self.func = func
+        functools.update_wrapper(self, func)
+
+    def __get__(self, obj, objtype=None):
+        return functools.partial(self.func, obj)
 
 
 def _clean_numeric_strings(s):
@@ -57,6 +259,178 @@ def _reject_dunder(expr):
     return expr
 
 
+# ------------------------------------------------------------------ HTML REPORT
+# A profile is worth sharing - with a reviewer, a ticket, a data owner who does
+# not have the file. That means ONE file that opens anywhere: styles inline, no
+# CDN link, no fonts to fetch, nothing that breaks behind a firewall or in an
+# email attachment.
+_REPORT_CSS = """
+:root { color-scheme: light dark; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+       Helvetica, Arial, sans-serif; line-height: 1.5; margin: 0;
+       padding: 2rem 1.25rem; background: #fbfbfa; color: #1a1a1a; }
+main { max-width: 60rem; margin: 0 auto; }
+h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.06em;
+     color: #6b6b6b; margin: 2rem 0 0.6rem; }
+.sub { color: #6b6b6b; margin: 0 0 0.5rem; font-size: 0.95rem; }
+.scroll { overflow-x: auto; }
+table { border-collapse: collapse; font-size: 0.88rem; width: 100%;
+        font-variant-numeric: tabular-nums; }
+th, td { padding: 0.4rem 0.7rem; text-align: left; white-space: nowrap;
+         border-bottom: 1px solid #e6e6e3; }
+thead th { background: #f0f0ed; font-weight: 600; }
+tbody tr:hover td { background: #f6f6f4; }
+ul.warn { list-style: none; padding: 0; margin: 0; }
+ul.warn li { padding: 0.5rem 0.75rem; margin-bottom: 0.35rem; border-radius: 4px;
+             background: #fff6e5; border-left: 3px solid #d98b00; }
+p.ok { padding: 0.5rem 0.75rem; border-radius: 4px; background: #eaf6ec;
+       border-left: 3px solid #2e7d43; margin: 0; }
+.note { font-size: 0.85rem; color: #6b6b6b; margin-top: 0.4rem; }
+footer { margin-top: 2.5rem; font-size: 0.8rem; color: #8a8a8a; }
+@media (prefers-color-scheme: dark) {
+  body { background: #17171a; color: #e8e8e6; }
+  h2, .sub, .note, footer { color: #9a9a97; }
+  th, td { border-bottom-color: #2e2e33; }
+  thead th { background: #232327; }
+  tbody tr:hover td { background: #1e1e22; }
+  ul.warn li { background: #2c2413; border-left-color: #d98b00; }
+  p.ok { background: #14251a; border-left-color: #2e7d43; }
+}
+"""
+
+
+def _html_report(profile, title="dclean profile"):
+    """Render a ``_profile()`` dict as ONE self-contained HTML document.
+
+    Every value that came from the data is escaped, and every style is inline:
+    the file opens with no network and nothing else beside it.
+    """
+    rows, cols = profile["rows"], profile["cols"]
+    parts = [
+        "<!doctype html>",
+        '<html lang="en"><head><meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>{_escape(title)}</title>",
+        f"<style>{_REPORT_CSS}</style>",
+        "</head><body><main>",
+        f"<h1>{_escape(title)}</h1>",
+        f'<p class="sub">{rows} rows &times; {cols} cols '
+        f'&middot; {profile["kb"]:.1f} KB in memory '
+        f'&middot; {profile["dupes"]} duplicate rows</p>',
+        "<h2>Columns</h2>",
+        '<div class="scroll">'
+        + pd.DataFrame(profile["table"]).to_html(index=False, border=0)
+        + "</div>",
+    ]
+    if not profile["examples"]:
+        parts.append('<p class="note">Example values are withheld '
+                     "(<code>examples=False</code>) - the type is shown "
+                     "instead, so this file carries no data of yours.</p>")
+    num = profile["numeric"]
+    if num is not None:
+        parts += ["<h2>Numeric summary</h2>",
+                  '<div class="scroll">'
+                  + num.to_html(border=0, float_format=lambda v: f"{v:.2f}")
+                  + "</div>"]
+    parts.append("<h2>Warnings</h2>")
+    if profile["warnings"]:
+        parts.append('<ul class="warn">'
+                     + "".join(f"<li>{_escape(w)}</li>" for w in profile["warnings"])
+                     + "</ul>")
+    else:
+        parts.append('<p class="ok">No data-quality warnings.</p>')
+    parts += ["<footer>Generated by dcleaner &middot; "
+              "<code>d.report(to=&quot;profile.html&quot;)</code></footer>",
+              "</main></body></html>"]
+    return "\n".join(parts)
+
+
+# --------------------------------------------------------------------- RECIPES
+# A pipeline is worth replaying: the same cleaning, next month's file. The log
+# already knows what happened, but it knows it as display strings - and
+# "drop(['a', 'b'])" cannot be turned back into a call without a parser for
+# dclean's own repr, which would be wrong the first time a column name contains
+# a quote. So each step carries a STRUCTURED record beside its display string,
+# and replay reads the structure and ignores the prose.
+RECIPE_FORMAT = 1
+
+# Replayable: a pure function of the frame plus JSON-serializable arguments.
+# join()/concat() need a second table a recipe cannot carry; groupby().agg() is
+# two calls - .mean(col, by=...) is the one-call form that records.
+REPLAYABLE = frozenset((
+    "clean", "fix_nulls", "drop_outliers", "dropna", "fillna", "drop", "keep",
+    "rename", "dedupe", "astype", "lower_cols", "to_float", "filter", "mutate",
+    "select", "sort", "copy",
+    "stat", "mean", "sum", "count", "median", "min", "max",
+    "top", "bottom", "counts", "summarize", "corr",
+))
+
+_NOT_REPLAYABLE_HINT = {
+    "join": "join() needs the other table, which a recipe cannot carry",
+    "concat": "concat() needs the other sources, which a recipe cannot carry",
+    "groupby": "groupby().agg() is two calls - use .mean(col, by=...) "
+               "(or .sum/.count/...), which records as one",
+    "agg": "groupby().agg() is two calls - use .mean(col, by=...) "
+           "(or .sum/.count/...), which records as one",
+}
+
+
+def _step(display, method=None, args=None, kwargs=None):
+    """One entry in the pipeline log.
+
+    ``display`` is what a human reads; ``method``/``args``/``kwargs`` are what
+    a recipe replays. A step with no ``method`` is recorded but cannot replay.
+    """
+    return {
+        "display": display,
+        "method": method,
+        "args": list(args) if args else [],
+        "kwargs": dict(kwargs) if kwargs else {},
+    }
+
+
+def _as_step(step):
+    """Accept a step dict or a bare display string (the older shape)."""
+    return dict(step) if isinstance(step, dict) else _step(str(step))
+
+
+def _jsonable(value):
+    """True when ``value`` survives a JSON round trip unchanged."""
+    try:
+        return json.loads(json.dumps(value)) == value
+    except (TypeError, ValueError):
+        return False
+
+
+def _version():
+    """The installed dcleaner version, recorded in a recipe for provenance."""
+    try:
+        from . import __version__
+        return __version__
+    except Exception:  # pragma: no cover - partially initialised package
+        return "unknown"
+
+
+def _require(modules, what, install=None):
+    """Import the first available of ``modules``, or say what to pip install.
+
+    Optional dependencies are imported at the point of use, never at import
+    time, so ``pip install dcleaner`` stays small - and the error names the
+    exact command that fixes it instead of a bare ImportError.
+    """
+    names = [modules] if isinstance(modules, str) else list(modules)
+    for name in names:
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    raise ImportError(
+        "{} needs {}, which dclean does not install for you. "
+        "Run:  pip install {}".format(
+            what, " or ".join(repr(n) for n in names), install or names[0]))
+
+
 def _normalize_name(name):
     """`  Total Sales ($) ` -> `total_sales`."""
     n = str(name).strip().lower()
@@ -81,14 +455,16 @@ class Data:
          .filter("age > 18")
          .groupby("city").agg("mean", "salary")
          .plot("bar", x="city", y="salary")
-         .savefig("out.png"))
+         .show())
 
     Inspect methods (``head``, ``nulls``, ``report`` ...) print and return the
     same object, since they change nothing. Drop back to raw pandas anytime
     with ``.to_df()``.
     """
 
-    def __init__(self, source=None, df=None, steps=None):
+    def __init__(self, source: Optional[Union[str, pd.DataFrame]] = None,
+                 df: Optional[pd.DataFrame] = None,
+                 steps: Optional[List[Any]] = None) -> None:
         if df is not None:
             self.df = df.copy()
         elif isinstance(source, pd.DataFrame):
@@ -101,20 +477,30 @@ class Data:
             raise TypeError(f"Data() can't handle source of type {type(source).__name__}")
         self._group = None
         self._fig = None
-        self._steps = list(steps) if steps else []
+        self._steps = [_as_step(s) for s in steps] if steps else []
 
     # ----------------------------------------------------------- INTERNAL
-    def _derive(self, df, step=None, group=None):
+    def _derive(self, df, step=None, group=None, call=None):
         """Build the next Data in the chain. Never touches ``self``.
 
         ``df`` is adopted as-is (pandas ops already return new frames), so a
         chain costs no redundant copies.
+
+        ``step`` is the line a human reads in ``log()``. ``call`` is the
+        ``(method, args, kwargs)`` a recipe replays - passed by the transform,
+        which already knows its own arguments, instead of being parsed back out
+        of the display string later. A transform with no ``call`` still logs;
+        it just cannot be replayed.
         """
         out = object.__new__(Data)
         out.df = df
         out._group = group
         out._fig = self._fig
-        out._steps = self._steps + ([step] if step else [])
+        entry = None
+        if step is not None:
+            method, args, kwargs = call if call else (None, (), {})
+            entry = _step(step, method, args, kwargs)
+        out._steps = self._steps + ([entry] if entry else [])
         return out
 
     # ----------------------------------------------------------- LOAD
@@ -144,12 +530,12 @@ class Data:
         raise ValueError(f"Unsupported file type: {path}")
 
     @classmethod
-    def from_records(cls, records):
+    def from_records(cls, records: List[dict]) -> "Data":
         """Build from a list of dicts."""
         return cls(df=pd.DataFrame(records))
 
     @staticmethod
-    def samples():
+    def samples() -> List[str]:
         """List the dataset names bundled with the package."""
         here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
         names = sorted(f for f in os.listdir(here) if f.endswith(".csv"))
@@ -157,17 +543,17 @@ class Data:
         return names
 
     # ----------------------------------------------------------- INSPECT
-    def head(self, n=5):
+    def head(self, n: int = 5) -> "Data":
         print(tabulate(self.df.head(n), headers="keys", tablefmt="github",
                        showindex=False))
         return self
 
-    def tail(self, n=5):
+    def tail(self, n: int = 5) -> "Data":
         print(tabulate(self.df.tail(n), headers="keys", tablefmt="github",
                        showindex=False))
         return self
 
-    def to_table(self, max_rows=None):
+    def to_table(self, max_rows: Optional[int] = None) -> "Data":
         """Render the FULL dataset as a formatted table (no column truncation).
 
         Pass ``max_rows`` to cap the number of printed rows - every column is
@@ -178,7 +564,7 @@ class Data:
         print(tabulate(df, headers="keys", tablefmt="github", showindex=False))
         return self
 
-    def print(self, n=None):
+    def print(self, n: Optional[int] = None) -> "Data":
         """Print the dataset itself (chainable).
 
         No argument -> print the FULL frame. Pass ``n`` to cap to the first
@@ -197,11 +583,11 @@ class Data:
         print(tabulate(df, headers="keys", tablefmt="github", showindex=False))
         return self
 
-    def info(self):
+    def info(self) -> "Data":
         self.df.info()
         return self
 
-    def shape(self):
+    def shape(self) -> "Data":
         """Print the shape, the column list, and each feature's dtype."""
         print(f"{self.df.shape[0]} rows x {self.df.shape[1]} cols")
         print("columns:", list(self.df.columns))
@@ -209,7 +595,7 @@ class Data:
         print(self.df.dtypes.to_string())
         return self
 
-    def dtypes(self):
+    def dtypes(self) -> "Data":
         """Print each feature's data type (a tidy ``column -> dtype`` list).
 
         For just the raw pandas Series, use ``.to_df().dtypes``.
@@ -217,11 +603,11 @@ class Data:
         print(self.df.dtypes.to_string())
         return self
 
-    def cols(self):
+    def cols(self) -> "Data":
         print(list(self.df.columns))
         return self
 
-    def describe(self):
+    def describe(self) -> "Data":
         """Pretty, highlighted summary of numeric columns.
 
         Prints a banner + a tidy table, then calls out the headline statistic
@@ -247,12 +633,13 @@ class Data:
             print(f"{BOLD}-> mean | {callout}{RESET}\n")
         return self
 
-    def nulls(self, plot=False):
+    def nulls(self, plot: bool = False, show: Optional[bool] = None) -> "Data":
         """Show missing-value counts per column (and the total).
 
         Returns the same object so it can sit in a chain right before
-        ``.dropna()``. Set ``plot=True`` to also render a bar chart of the null
-        counts (finish with ``.savefig()`` / ``.show()``).
+        ``.dropna()``. Set ``plot=True`` to also chart the null counts - it
+        renders inline in a notebook; from a script add ``.show()`` for a
+        window or ``.savefig()`` for a file.
         """
         counts = self.df.isna().sum()
         total = int(counts.sum())
@@ -264,32 +651,23 @@ class Data:
                        showindex=False))
         print(f"{BOLD}-> total nulls: {total} across {len(self.df)} rows{RESET}")
         if plot:
-            fig, ax = plt.subplots(figsize=(8, 4))
-            ax.bar(counts.index.astype(str), counts.values)
+            with _palette():
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.bar(counts.index.astype(str), counts.values,
+                       color=OKABE_ITO[0])
             ax.set_title("Missing values per column")
             ax.set_ylabel("nulls")
             plt.xticks(rotation=45, ha="right")
-            self._fig = fig
+            self._fig = _render(fig, show)
         return self
 
-    def report(self, examples=True):
-        """One-call profile of the whole dataset.
+    def _profile(self, examples=True):
+        """Measure the dataset once; ``report()`` decides how to show it.
 
-        Prints shape, a per-column breakdown (dtype, nulls, unique values, a
-        sample value), duplicate-row count, numeric summary stats, and a list
-        of data-quality warnings. This is the "what am I even looking at"
-        button - run it the moment you load a file.
-
-        The ``example`` column shows a real value from your data. Pass
-        ``examples=False`` to replace it with the value's type, which is what
-        you want before pasting a profile into a ticket, a log, or CI output
-        on data containing anything personal.
+        Internal. Returns a plain dict so the terminal and the HTML file are
+        rendered from exactly the same numbers - they can never drift.
         """
         df = self.df
-        print(f"\n{BOLD}{UNDER}DATASET REPORT{RESET}")
-        print(f"{df.shape[0]} rows x {df.shape[1]} cols  "
-              f"| {df.memory_usage(deep=True).sum() / 1024:.1f} KB in memory")
-
         rows = max(len(df), 1)
         table = []
         for c in df.columns:
@@ -310,22 +688,63 @@ class Data:
                 "unique": int(col.nunique(dropna=True)),
                 "example": shown,
             })
-        print(tabulate(pd.DataFrame(table), headers="keys", tablefmt="github",
-                       showindex=False))
-
-        dupes = int(df.duplicated().sum())
-        print(f"duplicate rows: {dupes}")
-
         num = df.select_dtypes(include="number")
-        if not num.empty:
-            print(f"\n{BOLD}numeric summary{RESET}")
-            print(tabulate(num.describe(), headers="keys", tablefmt="github",
-                           showindex=True, floatfmt=".2f"))
+        return {
+            "rows": df.shape[0],
+            "cols": df.shape[1],
+            "kb": df.memory_usage(deep=True).sum() / 1024,
+            "table": table,
+            "dupes": int(df.duplicated().sum()),
+            "numeric": None if num.empty else num.describe(),
+            "warnings": self._warnings(),
+            "examples": bool(examples),
+        }
 
-        warnings = self._warnings()
-        if warnings:
+    def report(self, examples: bool = True,
+               to: Optional[str] = None) -> "Data":
+        """One-call profile of the whole dataset.
+
+        Inspector: shows the profile and returns the SAME object.
+
+        Reports shape, a per-column breakdown (dtype, nulls, unique values, a
+        sample value), duplicate-row count, numeric summary stats, and a list
+        of data-quality warnings. This is the "what am I even looking at"
+        button - run it the moment you load a file.
+
+        The ``example`` column shows a real value from your data. Pass
+        ``examples=False`` to replace it with the value's type, which is what
+        you want before pasting a profile into a ticket, a log, or CI output
+        on data containing anything personal.
+
+        ``to="profile.html"`` writes the same profile to a self-contained HTML
+        file instead of printing it - one file, styles inline, nothing fetched
+        from a CDN, so it survives being emailed or attached to a ticket.
+        ``examples=False`` is honoured there too, and matters more: that file
+        is the one somebody else ends up holding.
+        """
+        profile = self._profile(examples)
+        if to:
+            title = f"dclean profile - {os.path.basename(str(to))}"
+            with open(to, "w", encoding="utf-8") as fh:
+                fh.write(_html_report(profile, title))
+            print(f"saved report -> {to}")
+            return self
+
+        print(f"\n{BOLD}{UNDER}DATASET REPORT{RESET}")
+        print(f"{profile['rows']} rows x {profile['cols']} cols  "
+              f"| {profile['kb']:.1f} KB in memory")
+        print(tabulate(pd.DataFrame(profile["table"]), headers="keys",
+                       tablefmt="github", showindex=False))
+        print(f"duplicate rows: {profile['dupes']}")
+
+        if profile["numeric"] is not None:
+            print(f"\n{BOLD}numeric summary{RESET}")
+            print(tabulate(profile["numeric"], headers="keys",
+                           tablefmt="github", showindex=True, floatfmt=".2f"))
+
+        if profile["warnings"]:
             print(f"\n{BOLD}warnings{RESET}")
-            for w in warnings:
+            for w in profile["warnings"]:
                 print(f"  ! {w}")
         else:
             print(f"\n{BOLD}-> no data-quality warnings{RESET}")
@@ -360,22 +779,27 @@ class Data:
                     out.append(f"'{c}' is unique per row - looks like an ID")
         return out
 
-    def log(self):
+    def log(self) -> "Data":
         """Print the steps that produced this dataset."""
         if not self._steps:
             print("(no transforms applied yet)")
         else:
             print(f"{BOLD}pipeline{RESET}")
             for i, s in enumerate(self._steps, 1):
-                print(f"  {i}. {s}")
+                print(f"  {i}. {s['display']}")
         return self
 
-    def steps(self):
-        """Return the applied-step log as a list of strings."""
-        return list(self._steps)
+    def steps(self) -> List[str]:
+        """Return the applied-step log as a list of strings.
+
+        Escape hatch: returns plain values. For the structured form a recipe
+        replays, use :meth:`save_recipe`.
+        """
+        return [s["display"] for s in self._steps]
 
     # ----------------------------------------------------------- AUTO
-    def clean(self, nulls="keep", dates=True, verbose=True):
+    def clean(self, nulls: str = "keep", dates: bool = True,
+              verbose: bool = True) -> "Data":
         """Auto-clean the dataset in one call.
 
         You say *clean it*; this works out the rest. It:
@@ -505,7 +929,8 @@ class Data:
             print(f"{BOLD}-> {before_rows}x{before_cols} to "
                   f"{df.shape[0]}x{df.shape[1]}, "
                   f"{int(df.isna().sum().sum())} nulls remaining{RESET}\n")
-        return self._derive(df, step=f"clean(nulls={nulls!r})")
+        return self._derive(df, step=f"clean(nulls={nulls!r})",
+                            call=("clean", (), {"nulls": nulls, "dates": bool(dates)}))
 
     @staticmethod
     def _dedupe_column_names(df):
@@ -521,7 +946,8 @@ class Data:
         df.columns = cols
         return df
 
-    def fix_nulls(self, strategy="auto", subset=None):
+    def fix_nulls(self, strategy: str = "auto",
+                  subset: Optional[Union[str, List[str]]] = None) -> "Data":
         """Fill missing values without you picking a statistic per column.
 
         ``strategy="auto"`` (default) uses the median for numeric columns and
@@ -553,9 +979,12 @@ class Data:
                     df[c] = df[c].fillna(mode.iloc[0])
             else:  # auto + numeric
                 df[c] = df[c].fillna(df[c].median())
-        return self._derive(df, step=f"fix_nulls({strategy!r})")
+        return self._derive(df, step=f"fix_nulls({strategy!r})",
+                            call=("fix_nulls", (), {"strategy": strategy,
+                                                    "subset": subset}))
 
-    def drop_outliers(self, cols=None, method="iqr", factor=1.5):
+    def drop_outliers(self, cols: Optional[Union[str, List[str]]] = None,
+                      method: str = "iqr", factor: float = 1.5) -> "Data":
         """Drop rows whose numeric values are statistical outliers.
 
         ``method="iqr"`` (default) removes points outside
@@ -583,41 +1012,51 @@ class Data:
         removed = int((~mask).sum())
         print(f"{BOLD}-> dropped {removed} outlier rows ({method}){RESET}")
         return self._derive(df[mask].reset_index(drop=True),
-                            step=f"drop_outliers({method!r}, factor={factor})")
+                            step=f"drop_outliers({method!r}, factor={factor})",
+                            call=("drop_outliers", (), {"cols": cols,
+                                                        "method": method,
+                                                        "factor": factor}))
 
     # ----------------------------------------------------------- CLEAN
-    def dropna(self, subset=None):
-        return self._derive(self.df.dropna(subset=subset), step="dropna()")
+    def dropna(self, subset: Optional[Union[str, List[str]]] = None) -> "Data":
+        return self._derive(self.df.dropna(subset=subset), step="dropna()",
+                            call=("dropna", (), {"subset": subset}))
 
-    def fillna(self, value):
-        return self._derive(self.df.fillna(value), step="fillna()")
+    def fillna(self, value: Any) -> "Data":
+        return self._derive(self.df.fillna(value), step="fillna()",
+                            call=("fillna", (value,), {}))
 
-    def drop(self, cols):
+    def drop(self, cols: Union[str, List[str]]) -> "Data":
         cols = [cols] if isinstance(cols, str) else list(cols)
         return self._derive(self.df.drop(columns=cols),
-                            step=f"drop({cols})")
+                            step=f"drop({cols})",
+                            call=("drop", (cols,), {}))
 
-    def keep(self, *cols):
+    def keep(self, *cols: str) -> "Data":
         cols = [c for c in cols if isinstance(c, str)]
-        return self._derive(self.df[cols], step=f"keep({cols})")
+        return self._derive(self.df[cols], step=f"keep({cols})",
+                            call=("keep", cols, {}))
 
-    def rename(self, **kwargs):
-        return self._derive(self.df.rename(columns=kwargs), step="rename()")
+    def rename(self, **kwargs: str) -> "Data":
+        return self._derive(self.df.rename(columns=kwargs), step="rename()",
+                            call=("rename", (), kwargs))
 
-    def dedupe(self, subset=None):
+    def dedupe(self, subset: Optional[Union[str, List[str]]] = None) -> "Data":
         return self._derive(self.df.drop_duplicates(subset=subset),
-                            step="dedupe()")
+                            step="dedupe()",
+                            call=("dedupe", (), {"subset": subset}))
 
-    def astype(self, **kwargs):
-        return self._derive(self.df.astype(kwargs), step="astype()")
+    def astype(self, **kwargs: Any) -> "Data":
+        return self._derive(self.df.astype(kwargs), step="astype()",
+                            call=("astype", (), kwargs))
 
-    def lower_cols(self):
+    def lower_cols(self) -> "Data":
         """Rename all columns to lowercase (common cleaning step)."""
         return self._derive(
             self.df.rename(columns={c: str(c).lower() for c in self.df.columns}),
-            step="lower_cols()")
+            step="lower_cols()", call=("lower_cols", (), {}))
 
-    def to_float(self, *cols):
+    def to_float(self, *cols: str) -> "Data":
         """Convert string/object column(s) to float.
 
         Named columns: ``.to_float("price", "qty")``. With no arguments, every
@@ -630,10 +1069,11 @@ class Data:
             df.select_dtypes(include="object").columns)
         for c in targets:
             df[c] = pd.to_numeric(_clean_numeric_strings(df[c]), errors="coerce")
-        return self._derive(df, step=f"to_float({list(targets)})")
+        return self._derive(df, step=f"to_float({list(targets)})",
+                            call=("to_float", tuple(cols), {}))
 
     # ----------------------------------------------------------- FILTER
-    def filter(self, expr):
+    def filter(self, expr: str) -> "Data":
         """Filter with a readable expression string.
 
         Supports: == != > < >= <= and or in not in
@@ -642,7 +1082,8 @@ class Data:
         resolves to score >= 70 and score <= 100.
         Columns with spaces must use back-ticks: filter("`total sales` > 100")
         """
-        return self._derive(self._apply_expr(expr), step=f"filter({expr!r})")
+        return self._derive(self._apply_expr(expr), step=f"filter({expr!r})",
+                            call=("filter", (expr,), {}))
 
     def _apply_expr(self, expr):
         """Return the frame filtered by ``expr`` (mask or query result)."""
@@ -664,7 +1105,7 @@ class Data:
             return self.df.query(expr, engine="python")
 
     # ----------------------------------------------------------- TRANSFORM
-    def mutate(self, **kwargs):
+    def mutate(self, **kwargs: Any) -> "Data":
         """Add/overwrite columns from expressions.
 
         mutate(bmi="weight / (height**2)", age1="age + 1")
@@ -673,7 +1114,8 @@ class Data:
         df = self.df.copy()
         for col, expr in kwargs.items():
             df[col] = self._eval_assign(df, expr) if isinstance(expr, str) else expr
-        return self._derive(df, step=f"mutate({list(kwargs)})")
+        return self._derive(df, step=f"mutate({list(kwargs)})",
+                            call=("mutate", (), kwargs))
 
     @staticmethod
     def _eval_assign(df, expr):
@@ -691,18 +1133,241 @@ class Data:
             ns = {str(c): df[c] for c in df.columns}
             return eval(expr, {"__builtins__": {}}, ns)  # noqa: S307
 
-    def select(self, *cols):
-        return self._derive(self.df[list(cols)], step=f"select({list(cols)})")
+    def select(self, *cols: str) -> "Data":
+        return self._derive(self.df[list(cols)], step=f"select({list(cols)})",
+                            call=("select", cols, {}))
 
-    def sort(self, by, ascending=True):
+    def sort(self, by: Union[str, List[str]],
+             ascending: bool = True) -> "Data":
         return self._derive(self.df.sort_values(by, ascending=ascending),
-                            step=f"sort({by!r})")
+                            step=f"sort({by!r})",
+                            call=("sort", (by,), {"ascending": ascending}))
+
+    # ----------------------------------------------------------- COMBINE
+    @staticmethod
+    def _as_frame(source):
+        """``Data`` / ``DataFrame`` / file path -> a DataFrame."""
+        if isinstance(source, Data):
+            return source.df
+        if isinstance(source, pd.DataFrame):
+            return source
+        if isinstance(source, str):
+            return Data(source).df
+        raise TypeError("expected a Data, a DataFrame or a file path, "
+                        f"got {type(source).__name__}")
+
+    @staticmethod
+    def _label(source, i):
+        """What to call a source in the report."""
+        return os.path.basename(source) if isinstance(source, str) else f"source {i}"
+
+    def join(self, other: Union[str, "Data", pd.DataFrame],
+             on: Optional[Union[str, List[str]]] = None,
+             how: str = "left",
+             left_on: Optional[Union[str, List[str]]] = None,
+             right_on: Optional[Union[str, List[str]]] = None,
+             suffix: str = "_right", verbose: bool = True) -> "Data":
+        """Join another table onto this one - and say what actually matched.
+
+            d.join("regions.csv", on="city")
+            d.join(other, on=["city", "year"], how="inner")
+            d.join(other, left_on="city_id", right_on="id")
+
+        ``other`` is a ``Data``, a DataFrame, or a path. ``on`` defaults to the
+        columns the two tables share. ``how`` is ``left`` (default), ``inner``,
+        ``right`` or ``outer``.
+
+        The report is the point. A join that silently matches nothing - because
+        one side says ``"SF "`` and the other ``"SF"`` - is the classic way to
+        get quietly wrong numbers, so this counts the rows that matched, shows
+        the keys that did not, tells you when they would match after
+        ``.clean()``, and warns when a non-unique key multiplied your rows.
+        Set ``verbose=False`` to skip it. Returns a NEW ``Data``.
+        """
+        if how not in ("left", "right", "inner", "outer"):
+            raise ValueError("how must be 'left', 'right', 'inner' or 'outer'")
+        right = self._as_frame(other)
+        left = self.df
+
+        # ---- work out the key
+        inferred = False
+        if on is not None:
+            lk = rk = _listify(on)
+        elif left_on is not None or right_on is not None:
+            if left_on is None or right_on is None:
+                raise ValueError("left_on and right_on must be given together "
+                                 "(or use on= for a shared column name)")
+            lk, rk = _listify(left_on), _listify(right_on)
+            if len(lk) != len(rk):
+                raise ValueError("left_on and right_on must name the same "
+                                 "number of columns")
+        else:
+            lk = rk = [c for c in left.columns if c in right.columns]
+            inferred = True
+            if not lk:
+                raise ValueError(
+                    "join() found no column in common - name the key with "
+                    "on='id', or left_on=/right_on= when the two sides spell "
+                    "it differently")
+        for k in lk:
+            if k not in left.columns:
+                raise KeyError(f"join key {k!r} is not a column on the left "
+                               f"(have: {', '.join(map(str, left.columns))})")
+        for k in rk:
+            if k not in right.columns:
+                raise KeyError(f"join key {k!r} is not a column on the right "
+                               f"(have: {', '.join(map(str, right.columns))})")
+
+        # ---- types have to agree, and pandas' own error does not say how to fix it
+        for a, b in zip(lk, rk):
+            ka, kb = _dtype_kind(left[a]), _dtype_kind(right[b])
+            if ka != kb:
+                raise ValueError(
+                    f"join key {a!r} is {ka} on the left but {b!r} is {kb} on "
+                    f"the right - they can never match. Make them agree first, "
+                    f"e.g. .to_float({a!r}) or .astype({a}='str')")
+
+        # ---- who matched whom, measured before the merge so `how` can't hide
+        # it. Only when someone is going to read it: on a big frame this walks
+        # both key columns, and verbose=False should stay as cheap as pd.merge.
+        if verbose:
+            left_keys, right_keys = _key_tuples(left, lk), _key_tuples(right, rk)
+            right_set, left_set = set(right_keys), set(left_keys)
+            l_hit = [k in right_set for k in left_keys]
+            r_hit = [k in left_set for k in right_keys]
+            n_l_miss, n_r_miss = l_hit.count(False), r_hit.count(False)
+            missed = sorted({k for k, hit in zip(left_keys, l_hit) if not hit},
+                            key=lambda t: tuple(map(str, t)))
+
+            # ---- would those misses match if the key were cleaned up?
+            near = 0
+            if missed and any(_dtype_kind(left[k]) == "text" for k in lk):
+                folded_right = set(_folded_key_tuples(right, rk))
+                miss_rows = left.loc[[not h for h in l_hit], lk]
+                near = len({t for t in _folded_key_tuples(miss_rows, lk)
+                            if t in folded_right})
+
+        overlap = [c for c in right.columns
+                   if c in left.columns and c not in (rk if lk == rk else [])]
+        merged = (pd.merge(left, right, on=lk, how=how, suffixes=("", suffix))
+                  if lk == rk else
+                  pd.merge(left, right, left_on=lk, right_on=rk, how=how,
+                           suffixes=("", suffix)))
+        merged = merged.reset_index(drop=True)
+
+        if verbose:
+            key_txt = lk[0] if len(lk) == 1 else str(lk)
+            print(f"\n{BOLD}{UNDER}JOIN{RESET}")
+            print(f"  + {how} join on {key_txt!r}"
+                  f"{' (inferred - the shared column)' if inferred else ''}")
+            print(f"  + {l_hit.count(True)} of {len(left)} left rows matched, "
+                  f"{r_hit.count(True)} of {len(right)} right rows used")
+            if n_l_miss:
+                fate = "dropped" if how in ("inner", "right") else "kept, with nulls"
+                print(f"  ! {_rows(n_l_miss)} on the left matched nothing "
+                      f"({fate}): {_fmt_keys(missed)}")
+            if near:
+                print(f"  ! {near} of those keys match after case/whitespace "
+                      f"folding - .clean() both sides before joining")
+            if n_r_miss:
+                fate = "dropped" if how in ("inner", "left") else "kept, with nulls"
+                print(f"  ! {_rows(n_r_miss)} on the right matched nothing ({fate})")
+            n_null_keys = int(left[lk].isna().any(axis=1).sum())
+            if n_null_keys:
+                print(f"  ! {_rows(n_null_keys)} on the left have a null key")
+            if len(merged) > len(left) and how in ("left", "inner"):
+                print(f"  ! the right key is not unique - the join added "
+                      f"{_rows(len(merged) - len(left))}")
+            if overlap:
+                print(f"  + right columns kept under a suffix: "
+                      f"{', '.join(f'{c}{suffix}' for c in overlap)}")
+            print(f"{BOLD}-> {left.shape[0]}x{left.shape[1]} to "
+                  f"{merged.shape[0]}x{merged.shape[1]}{RESET}\n")
+
+        key_repr = lk[0] if len(lk) == 1 else lk
+        return self._derive(merged, step=f"join({how!r}, on={key_repr!r})")
+
+    @_classorinstance
+    def concat(self, *sources: Any, source_col: Optional[str] = None,
+               verbose: bool = True) -> "Data":
+        """Stack tables on top of each other - files, globs, Data or frames.
+
+            Data.concat("data/2024-*.csv")            # a folder of monthly files
+            Data.concat("jan.csv", "feb.csv")
+            d.concat(more)                            # onto an existing Data
+
+        ``source_col="file"`` records which source each row came from, which is
+        what you want the moment two files disagree.
+
+        Columns are matched by name; the report calls out the two things that
+        quietly ruin a stacked dataset - a column missing from one source (it
+        becomes nulls) and a column whose type differs between sources (the
+        result falls back to text). Returns a NEW ``Data``.
+        """
+        items = list(sources)
+        if len(items) == 1 and isinstance(items[0], (list, tuple)):
+            items = list(items[0])
+        # a glob only earns its keep if it matches something
+        expanded = []
+        for item in items:
+            if isinstance(item, str) and any(ch in item for ch in "*?["):
+                hits = sorted(glob.glob(item))
+                if not hits:
+                    raise ValueError(f"no files match {item!r}")
+                expanded.extend(hits)
+            else:
+                expanded.append(item)
+        if self is not None:
+            expanded.insert(0, self)
+        if not expanded:
+            raise ValueError("concat() needs at least one source")
+
+        frames, labels = [], []
+        for i, item in enumerate(expanded):
+            frames.append(Data._as_frame(item))
+            labels.append(Data._label(item, i))
+        if self is not None:
+            labels[0] = "this data"
+        if source_col:
+            frames = [f.assign(**{source_col: lab}) for f, lab in zip(frames, labels)]
+
+        cols = []
+        for f in frames:
+            cols.extend(c for c in f.columns if c not in cols)
+        out = pd.concat(frames, ignore_index=True, sort=False).reindex(columns=cols)
+
+        if verbose:
+            print(f"\n{BOLD}{UNDER}CONCAT{RESET}")
+            print(f"  + {len(frames)} sources: "
+                  f"{', '.join(f'{lab} ({_rows(len(f))})' for lab, f in zip(labels, frames))}")
+            for c in cols:
+                absent = [lab for lab, f in zip(labels, frames) if c not in f.columns]
+                if absent:
+                    print(f"  ! {c!r} is missing from {', '.join(absent)} "
+                          f"- those rows are null there")
+                kinds = {_dtype_kind(f[c]) for f in frames if c in f.columns}
+                if len(kinds) > 1:
+                    print(f"  ! {c!r} is {' / '.join(sorted(kinds))} in different "
+                          f"sources - run .clean() on the result")
+            n_dupes = int(out.duplicated().sum())
+            if n_dupes:
+                hint = "" if source_col else ", source_col='file' shows where from"
+                print(f"  ! {_rows(n_dupes)} duplicated across sources "
+                      f"- .dedupe() drops them{hint}")
+            if source_col:
+                print(f"  + tagged every row with its source in {source_col!r}")
+            print(f"{BOLD}-> {out.shape[0]}x{out.shape[1]}{RESET}\n")
+
+        step = f"concat({len(frames)} sources)"
+        if self is not None:
+            return self._derive(out, step=step)
+        return Data(df=out, steps=[step])
 
     # ----------------------------------------------------------- AGGREGATE
-    def groupby(self, *cols):
+    def groupby(self, *cols: str) -> "Data":
         return self._derive(self.df, group=list(cols))
 
-    def agg(self, how, col=None):
+    def agg(self, how: str, col: Optional[str] = None) -> "Data":
         if not self._group:
             raise RuntimeError("Call groupby() before agg()")
         grp = self.df.groupby(self._group)
@@ -712,7 +1377,8 @@ class Data:
             out = grp.agg({col: how}).reset_index()
         return self._derive(out, step=f"groupby({self._group}).agg({how!r}, {col!r})")
 
-    def stat(self, how, col=None, by=None):
+    def stat(self, how: str, col: Optional[str] = None,
+             by: Optional[Union[str, List[str]]] = None) -> "Data":
         """One-call aggregate - no separate ``groupby()`` step.
 
             d.stat("mean", "price", by="city")
@@ -733,51 +1399,61 @@ class Data:
                    else self.df.select_dtypes(include="number").agg(how).to_frame().T)
         else:
             out = pd.DataFrame([{f"{how}_{col}": getattr(self.df[col], how)()}])
-        return self._derive(out, step=f"stat({how!r}, {col!r}, by={by!r})")
+        return self._derive(out, step=f"stat({how!r}, {col!r}, by={by!r})",
+                            call=("stat", (how,), {"col": col, "by": by}))
 
-    def mean(self, col=None, by=None):
+    def mean(self, col: Optional[str] = None,
+                 by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.mean("price", by="city")`` - mean of a column, optionally grouped."""
         return self.stat("mean", col, by)
 
-    def sum(self, col=None, by=None):
+    def sum(self, col: Optional[str] = None,
+                by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.sum("revenue", by="city")``"""
         return self.stat("sum", col, by)
 
-    def count(self, col=None, by=None):
+    def count(self, col: Optional[str] = None,
+                  by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.count(by="city")`` - rows per group (no dummy column needed)."""
         return self.stat("count", col, by)
 
-    def median(self, col=None, by=None):
+    def median(self, col: Optional[str] = None,
+                   by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.median("price", by="city")``"""
         return self.stat("median", col, by)
 
-    def min(self, col=None, by=None):
+    def min(self, col: Optional[str] = None,
+                by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.min("price", by="city")``"""
         return self.stat("min", col, by)
 
-    def max(self, col=None, by=None):
+    def max(self, col: Optional[str] = None,
+                by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.max("price", by="city")``"""
         return self.stat("max", col, by)
 
-    def top(self, n=5, by=None):
+    def top(self, n: int = 5, by: Optional[str] = None) -> "Data":
         """``d.top(5, "price")`` - the n highest rows by a column."""
         df = self.df if by is None else self.df.sort_values(by, ascending=False)
         return self._derive(df.head(n).reset_index(drop=True),
-                            step=f"top({n}, {by!r})")
+                            step=f"top({n}, {by!r})",
+                            call=("top", (), {"n": n, "by": by}))
 
-    def bottom(self, n=5, by=None):
+    def bottom(self, n: int = 5, by: Optional[str] = None) -> "Data":
         """``d.bottom(5, "price")`` - the n lowest rows by a column."""
         df = self.df if by is None else self.df.sort_values(by, ascending=True)
         return self._derive(df.head(n).reset_index(drop=True),
-                            step=f"bottom({n}, {by!r})")
+                            step=f"bottom({n}, {by!r})",
+                            call=("bottom", (), {"n": n, "by": by}))
 
-    def counts(self, col):
+    def counts(self, col: str) -> "Data":
         """``d.counts("city")`` - frequency table for one column."""
         out = self.df[col].value_counts(dropna=False).reset_index()
         out.columns = [col, "count"]
-        return self._derive(out, step=f"counts({col!r})")
+        return self._derive(out, step=f"counts({col!r})",
+                            call=("counts", (col,), {}))
 
-    def summarize(self, **kwargs):
+    def summarize(self, **kwargs: str) -> "Data":
         """Quick named stats. summarize(mean_sal='mean(salary)', n='count()')"""
         out = {}
         for k, v in kwargs.items():
@@ -790,51 +1466,74 @@ class Data:
                     out[k] = len(self.df)
                 else:
                     out[k] = getattr(self.df, func)()
-        return self._derive(pd.DataFrame([out]), step=f"summarize({list(kwargs)})")
+        return self._derive(pd.DataFrame([out]), step=f"summarize({list(kwargs)})",
+                            call=("summarize", (), kwargs))
 
-    def corr(self, method="pearson"):
+    def corr(self, method: str = "pearson") -> "Data":
         """Return the correlation matrix as a DataFrame."""
         return self._derive(self.df.corr(numeric_only=True, method=method),
-                            step=f"corr({method!r})")
+                            step=f"corr({method!r})",
+                            call=("corr", (), {"method": method}))
 
-    def plot_corr(self, title="Correlation matrix", cmap="coolwarm"):
-        """Heatmap of the numeric correlation matrix."""
+    def plot_corr(self, title: str = "Correlation matrix", cmap: str = DIVERGING,
+                  show: Optional[bool] = None) -> "Data":
+        """Heatmap of the numeric correlation matrix.
+
+        Plot method: draws and returns the SAME object.
+
+        Renders inline in a notebook; ``show=True`` forces a window, and
+        ``show=False`` holds the figure for ``.savefig()``.
+
+        The default ``cmap`` diverges about zero and is readable with the
+        common colour-vision deficiencies; pass any matplotlib colormap name
+        to override it. The scale is pinned to -1..+1 so the midpoint really
+        is "no correlation" - on an auto-scaled heatmap the neutral colour
+        lands wherever the data happens to sit, which reads as a lie.
+        """
         fig, ax = plt.subplots(figsize=(8, 6))
         c = self.df.corr(numeric_only=True)
-        im = ax.imshow(c, cmap=cmap)
+        im = ax.imshow(c, cmap=cmap, vmin=-1, vmax=1)
         ax.set_xticks(range(len(c.columns)))
         ax.set_yticks(range(len(c.columns)))
         ax.set_xticklabels(c.columns, rotation=45, ha="right")
         ax.set_yticklabels(c.columns)
         fig.colorbar(im, ax=ax)
         ax.set_title(title)
-        self._fig = fig
+        self._fig = _render(fig, show)
         return self
 
     # ----------------------------------------------------------- VISUALIZE
-    def plot(self, kind="line", x=None, y=None, title=None, **kwargs):
+    def plot(self, kind: str = "line", x: Optional[str] = None,
+             y: Optional[str] = None, title: Optional[str] = None,
+             show: Optional[bool] = None, **kwargs: Any) -> "Data":
         """One-liner plot. kind: line|bar|hist|scatter|box|pie
 
         ``x`` and ``y`` are optional: on a two-column frame (what a grouped
         aggregate leaves you with) they are inferred, so a whole pipeline
         ends ``.mean("price", by="city").plot("bar")``.
+
+        The chart shows up where you are working - inline in a notebook, no
+        PNG round-trip. From a script or REPL, end the chain with ``.show()``
+        to open it in a window (or pass ``show=True``), or ``.savefig(path)``
+        to write it out. ``show=False`` always holds the figure back.
         """
         if x is None and y is None:
             x, y = self._infer_xy(kind)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        if kind == "scatter":
-            ax.scatter(self.df[x], self.df[y])
-        elif kind == "hist":
-            ax.hist(self.df[x or y], **kwargs)
-        elif kind == "box":
-            self.df.boxplot(column=y, by=x, ax=ax)
-        elif kind == "pie":
-            self.df.plot(kind="pie", y=y, labels=self.df[x], ax=ax, **kwargs)
-        else:
-            self.df.plot(kind=kind, x=x, y=y, ax=ax, **kwargs)
+        with _palette(kwargs):
+            fig, ax = plt.subplots(figsize=(8, 5))
+            if kind == "scatter":
+                ax.scatter(self.df[x], self.df[y])
+            elif kind == "hist":
+                ax.hist(self.df[x or y], **kwargs)
+            elif kind == "box":
+                self.df.boxplot(column=y, by=x, ax=ax)
+            elif kind == "pie":
+                self.df.plot(kind="pie", y=y, labels=self.df[x], ax=ax, **kwargs)
+            else:
+                self.df.plot(kind=kind, x=x, y=y, ax=ax, **kwargs)
         if title:
             ax.set_title(title)
-        self._fig = fig
+        self._fig = _render(fig, show)
         return self
 
     def _infer_xy(self, kind):
@@ -851,14 +1550,21 @@ class Data:
         # is no separate label column (a one-column frame plots against index).
         return (other[0] if other else None), num[0]
 
-    def show(self):
+    def show(self) -> "Data":
+        """Display the current figure - or the data, if there is no figure.
+
+        In a notebook the chart renders inline, in the same cell; from a script
+        or REPL it opens in a window. On a machine with no display (CI, a
+        server) it says so and points you at ``.savefig()``.
+        """
         if self._fig is not None:
-            plt.show()
+            _render(self._fig, True)
         else:
             print(self.df)
         return self
 
-    def savefig(self, path):
+    def savefig(self, path: str) -> "Data":
+        """Write the current figure to a file. For when you want the PNG."""
         if self._fig is not None:
             self._fig.savefig(path, bbox_inches="tight")
             print(f"saved plot -> {path}")
@@ -866,28 +1572,192 @@ class Data:
             raise RuntimeError("No figure to save. Call plot()/plot_corr() first.")
         return self
 
+    # ----------------------------------------------------------- RECIPES
+    def save_recipe(self, path: str) -> "Data":
+        """Write this pipeline to a JSON recipe another file can replay.
+
+        Output method: writes a file and returns the SAME object.
+
+            Data("jan.csv").clean().filter("units > 5").save_recipe("m.json")
+
+        Only whitelisted steps replay (see ``dclean.core.REPLAYABLE``). A step
+        that cannot - `join()`, `concat()`, `groupby().agg()` - is refused HERE,
+        naming the step, rather than dropped: a recipe that quietly skipped your
+        join would produce a different dataset without saying so.
+        """
+        steps = []
+        for i, s in enumerate(self._steps, 1):
+            method = s["method"]
+            if method not in REPLAYABLE:
+                hint = _NOT_REPLAYABLE_HINT.get(
+                    str(s["display"]).split("(")[0].split(".")[0], "")
+                raise ValueError(
+                    "step {} ({}) cannot be replayed{}. Remove it from the "
+                    "pipeline you save the recipe from, or save the recipe "
+                    "before it.".format(i, s["display"], " - " + hint if hint else ""))
+            for name, value in list(s["kwargs"].items()) + list(enumerate(s["args"])):
+                if not _jsonable(value):
+                    raise ValueError(
+                        "step {} ({}) has an argument that is not JSON - {!r}. "
+                        "A recipe is a plain file; pass column names and "
+                        "literals, not objects.".format(i, s["display"], value))
+            steps.append({"method": method, "args": s["args"],
+                          "kwargs": s["kwargs"], "display": s["display"]})
+
+        recipe = {
+            "recipe": RECIPE_FORMAT,
+            "dcleaner": _version(),
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "steps": steps,
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(recipe, fh, indent=2)
+            fh.write("\n")
+        print(f"saved recipe -> {path} ({len(steps)} steps)")
+        return self
+
+    def apply_recipe(self, path: str, verbose: bool = True) -> "Data":
+        """Replay a saved recipe onto this dataset. Returns a NEW ``Data``.
+
+        Transform: every step in the recipe runs in order, exactly as if you
+        had typed the calls, so the result carries the whole pipeline in its
+        own ``log()``::
+
+            Data("feb.csv").apply_recipe("monthly.json")
+
+        Only whitelisted methods run - the check is repeated here because the
+        file may have been edited since it was written - and an unknown method
+        is an error, never a silent skip.
+
+        SECURITY: `filter()` and `mutate()` steps are expressions that get
+        evaluated, so a recipe file is as trusted as a Python script. Run
+        recipes you wrote, not recipes you were sent.
+        """
+        with open(path, encoding="utf-8") as fh:
+            recipe = json.load(fh)
+        if not isinstance(recipe, dict) or "steps" not in recipe:
+            raise ValueError(f"{path} is not a dclean recipe (no 'steps' key)")
+        fmt = recipe.get("recipe")
+        if fmt != RECIPE_FORMAT:
+            raise ValueError(
+                f"{path} is recipe format {fmt!r}, this dcleaner reads "
+                f"{RECIPE_FORMAT}. Re-save it with the version that wrote it.")
+
+        out = self
+        for i, s in enumerate(recipe["steps"], 1):
+            method = s.get("method")
+            if method not in REPLAYABLE:
+                raise ValueError(
+                    "step {} of {} calls {!r}, which dclean will not replay. "
+                    "Replayable methods: {}".format(
+                        i, path, method, ", ".join(sorted(REPLAYABLE))))
+            args = list(s.get("args") or [])
+            kwargs = dict(s.get("kwargs") or {})
+            try:
+                out = getattr(out, method)(*args, **kwargs)
+            except Exception as e:
+                raise ValueError(
+                    "step {} of {} - {}({}) - failed on this data: {}".format(
+                        i, path, method,
+                        ", ".join([repr(a) for a in args]
+                                  + [f"{k}={v!r}" for k, v in kwargs.items()]),
+                        e))
+        if verbose:
+            print(f"{BOLD}-> replayed {len(recipe['steps'])} steps from "
+                  f"{path}{RESET}")
+        return out
+
     # ----------------------------------------------------------- EXPORT
-    def to_csv(self, path):
+    def to_csv(self, path: str) -> "Data":
+        """Write the frame to CSV, no index column.
+
+        Output method: writes a file and returns the SAME object, so an export
+        can sit mid-chain.
+        """
         self.df.to_csv(path, index=False)
         print(f"saved -> {path}")
         return self
 
-    def to_df(self):
+    def to_excel(self, path: str, sheet_name: str = "Sheet1") -> "Data":
+        """Write the frame to an Excel workbook, no index column.
+
+        Output method: writes a file and returns the SAME object.
+
+        Needs ``openpyxl``, which dclean does not install for you
+        (``pip install openpyxl``); the error says so if it is missing.
+        """
+        _require("openpyxl", "to_excel()")
+        self.df.to_excel(path, sheet_name=sheet_name, index=False)
+        print(f"saved -> {path}")
+        return self
+
+    def to_json(self, path: str, orient: str = "records",
+                indent: int = 2) -> "Data":
+        """Write the frame to JSON.
+
+        Output method: writes a file and returns the SAME object.
+
+        Defaults to ``orient="records"`` - a list of row objects, the shape
+        most tools expect - and ISO-8601 dates, so a column ``clean()`` parsed
+        into datetimes reads back as a date rather than epoch milliseconds.
+        """
+        self.df.to_json(path, orient=orient, indent=indent, date_format="iso")
+        print(f"saved -> {path}")
+        return self
+
+    def to_parquet(self, path: str, **kwargs: Any) -> "Data":
+        """Write the frame to Parquet.
+
+        Output method: writes a file and returns the SAME object.
+
+        Needs ``pyarrow`` or ``fastparquet``, neither of which dclean installs
+        for you (``pip install pyarrow``); the error says so if both are
+        missing. Extra keyword arguments go straight to pandas
+        (``compression=``, ``engine=`` ...).
+        """
+        _require(("pyarrow", "fastparquet"), "to_parquet()", install="pyarrow")
+        self.df.to_parquet(path, index=False, **kwargs)
+        print(f"saved -> {path}")
+        return self
+
+    def to_df(self) -> pd.DataFrame:
         """Hand back the raw DataFrame for full pandas power."""
         return self.df
 
-    def copy(self):
+    def to_fig(self) -> Figure:
+        """Hand back the matplotlib Figure for full matplotlib power."""
+        if self._fig is None:
+            raise RuntimeError("No figure yet. Call plot()/plot_corr() first.")
+        return self._fig
+
+    def copy(self) -> "Data":
         """An independent copy (rarely needed - transforms already copy)."""
-        return self._derive(self.df.copy(), step="copy()")
+        return self._derive(self.df.copy(), step="copy()", call=("copy", (), {}))
 
     # ----------------------------------------------------------- DUNDERS
-    def __str__(self):
+    def __str__(self) -> str:
         """`print(d)` shows the full dataset (not just the terse repr)."""
         return tabulate(self.df, headers="keys", tablefmt="github", showindex=False)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         cols = ", ".join(map(str, self.df.columns)) if len(self.df.columns) else "-"
         return f"dclean.Data({self.df.shape[0]}x{self.df.shape[1]}, cols=[{cols}])"
 
-    def __len__(self):
+    def _repr_html_(self, n: int = 10) -> str:
+        """Rich table for Jupyter - a display hook, so it changes nothing.
+
+        A notebook renders this in place of ``__repr__``, so a bare ``d`` at
+        the end of a cell shows the data instead of only its shape. ``repr()``
+        and ``str()`` are deliberately left alone: the terminal keeps the terse
+        one-liner and ``print(d)`` keeps the full table.
+        """
+        rows, cols = self.df.shape
+        header = f"{rows} rows &times; {cols} cols"
+        if rows > n:
+            header += f" &mdash; showing the first {n}"
+        return (f'<div style="font-family:monospace;font-size:0.9em;'
+                f'margin-bottom:0.4em"><b>dclean.Data</b> &mdash; {header}</div>'
+                f'{self.df.head(n).to_html()}')
+
+    def __len__(self) -> int:
         return len(self.df)
