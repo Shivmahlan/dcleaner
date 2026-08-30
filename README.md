@@ -190,6 +190,19 @@ warnings
   ! 'Legacy Column' is entirely empty
 ```
 
+**Send it to someone.** `to=` writes the same profile as a single HTML file —
+styles inline, nothing loaded from a CDN — so it opens anywhere: attached to a
+ticket, emailed, or dropped in a shared folder.
+
+```python
+Data("sales.csv").report(to="profile.html")
+Data("sales.csv").report(examples=False, to="profile.html")   # no real values
+```
+
+`examples=False` matters more here than in the terminal: the HTML file is the
+one somebody else ends up holding, so that flag keeps your actual data out of
+it — the column shows `<str>` / `<int64>` instead.
+
 ### One call per idea
 
 Common questions shouldn't cost you two calls and a dummy column:
@@ -332,6 +345,7 @@ d.info()            # pandas .info()  (incl. per-column dtypes)
 d.describe()        # highlighted summary stats of numeric columns
 d.nulls()           # missing-value counts per column (+ total)
 d.report()          # FULL profile: dtypes, nulls, dupes, stats, warnings
+d.report(to="p.html")  # ...the same profile as one shareable HTML file
 d.log()             # the pipeline steps that produced this frame
 ```
 
@@ -720,6 +734,7 @@ d.info()                             # pandas .info()
 d.describe()                         # highlighted numeric summary
 d.nulls()         d.nulls(plot=True) # missing values per column (+ chart)
 d.report()                           # dtypes, nulls, dupes, stats, warnings
+d.report(to="profile.html")          # same profile, one self-contained file
 d.log()           d.steps()          # what this pipeline actually did
 print(d)          len(d)             # table render / row count
 ```
@@ -822,7 +837,7 @@ d.to_fig()                           # the matplotlib Figure - full matplotlib
 
 | Task | Method | Notes |
 |------|--------|-------|
-| **Do it all** | `dclean.clean(src, to=...)` `dclean.report(src)` `.clean([nulls])` `.report()` | one call: name the file, the library handles the rest |
+| **Do it all** | `dclean.clean(src, to=...)` `dclean.report(src)` `.clean([nulls])` `.report([examples], [to])` | one call: name the file, the library handles the rest; `report(to="x.html")` writes a shareable profile |
 | Load file | `Data("file.csv")` | auto-detects csv/xls/xlsx/json/parquet |
 | From frame | `Data(df)` / `Data.from_records([...])` | |
 | Inspect | `.head(n)` `.tail(n)` `.print([n])` `.to_table([max_rows])` `.shape()` `.dtypes()` `.cols()` `.info()` `.describe()` `.nulls([plot], [show])` | `print(d)` renders the dataset; `repr(d)` stays terse. `.shape()` and `.dtypes()` show per-feature types |
@@ -915,6 +930,7 @@ you want locally and exactly what you don't want in a shared log. Pass
 
 ```python
 d.report(examples=False)    # example column shows <str>, <int64>, ...
+d.report(examples=False, to="profile.html")   # ...and in the shareable file
 ```
 
 ---

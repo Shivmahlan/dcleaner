@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **`report(to="profile.html")` - a profile you can send to someone.** The same
+  per-column dtypes, null counts, unique counts, duplicate count, numeric stats
+  and warnings the terminal prints, written as ONE self-contained HTML file:
+  styles inline, no CDN link, nothing fetched at open time, so it survives an
+  email attachment, a ticket and a firewall. `examples=False` is honoured there
+  too, and matters more - that file is the one somebody else ends up holding.
+  Values and column names taken from your data are HTML-escaped. Default
+  behaviour is untouched: with no `to=`, `report()` prints exactly what it
+  printed before.
 - **Export parity with loading.** `dclean` reads csv/csv.gz/xls/xlsx/json/parquet
   but could only write CSV. `to_excel(path)`, `to_json(path)` and
   `to_parquet(path)` join `to_csv(path)`, all with the same contract: write the

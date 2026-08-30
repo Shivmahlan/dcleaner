@@ -798,3 +798,97 @@ def test_exports_write_no_index_column(tmp_path):
     out = tmp_path / "out.csv"
     d.to_csv(str(out))
     assert Data(str(out)).df.columns.tolist() == d.df.columns.tolist()
+
+
+# ----------------------------------------------------------------- HTML REPORT
+def test_report_to_html_writes_a_file_and_returns_self(tmp_path):
+    out = tmp_path / "profile.html"
+    d = Data(SAMPLE)
+    assert d.report(to=str(out)) is d
+    html = out.read_text(encoding="utf-8")
+    assert html.startswith("<!doctype html>")
+    assert "</html>" in html
+
+
+def test_html_report_is_self_contained(tmp_path):
+    # One file that opens anywhere: styles inline, nothing fetched over the
+    # network, or it breaks behind a firewall and as an email attachment.
+    out = tmp_path / "profile.html"
+    Data(SAMPLE).report(to=str(out))
+    html = out.read_text(encoding="utf-8")
+    assert "<style>" in html
+    assert 'src="http' not in html
+    assert 'href="http' not in html
+    assert "cdn" not in html.lower()
+
+
+def test_html_report_carries_the_same_facts_as_the_terminal(tmp_path, capsys):
+    d = Data("sample_sales.csv")
+    d.report()
+    printed = capsys.readouterr().out
+    out = tmp_path / "profile.html"
+    d.report(to=str(out))
+    html = out.read_text(encoding="utf-8")
+
+    profile = d._profile()
+    for col in d.df.columns:                      # dtypes / null / unique rows
+        assert str(col).strip() in html           # to_html trims cell padding
+        assert str(col).strip() in printed
+    assert str(profile["dupes"]) in html          # duplicate count
+    assert "duplicate rows" in printed
+    assert "Numeric summary" in html              # numeric stats
+    assert "numeric summary" in printed
+    for w in profile["warnings"]:                 # warnings
+        assert w in html or w.replace("'", "&#x27;") in html
+
+
+def test_html_report_honours_examples_false(tmp_path):
+    d = Data.from_records([{"email": "alice@example.com", "n": 1},
+                           {"email": "bob@example.com", "n": 2}])
+    shared = tmp_path / "shared.html"
+    d.report(examples=False, to=str(shared))
+    text = shared.read_text(encoding="utf-8")
+    assert "alice@example.com" not in text
+    assert "&lt;str&gt;" in text or "<str>" in text
+    assert "withheld" in text
+
+    # the default still shows a real example - that is the useful behaviour
+    full = tmp_path / "full.html"
+    d.report(to=str(full))
+    assert "alice@example.com" in full.read_text(encoding="utf-8")
+
+
+def test_html_report_escapes_values_and_column_names(tmp_path):
+    d = Data.from_records([{"<script>": "<img onerror=x>"},
+                           {"<script>": "<img onerror=x>"}])
+    out = tmp_path / "nasty.html"
+    d.report(to=str(out))
+    text = out.read_text(encoding="utf-8")
+    # nothing from the data may reach the document as live markup
+    assert "<script>" not in text.replace("<style>", "")
+    assert "<img onerror" not in text
+    assert "&lt;script&gt;" in text
+
+
+def test_report_without_to_still_prints_and_writes_nothing(tmp_path, capsys):
+    before = set(os.listdir(str(tmp_path)))
+    Data(SAMPLE).report()
+    assert "DATASET REPORT" in capsys.readouterr().out
+    assert set(os.listdir(str(tmp_path))) == before
+
+
+def test_html_report_survives_a_frame_with_no_numeric_columns(tmp_path):
+    d = Data.from_records([{"city": "NY"}, {"city": "LA"}])
+    out = tmp_path / "text.html"
+    d.report(to=str(out))
+    text = out.read_text(encoding="utf-8")
+    assert "Numeric summary" not in text
+    assert "Warnings" in text
+
+
+def test_html_report_says_so_when_there_is_nothing_to_warn_about(tmp_path):
+    # repeated values on purpose: unique-per-row text would warn "looks like an ID"
+    d = Data.from_records([{"a": 1, "b": "x"}, {"a": 2, "b": "x"}, {"a": 1, "b": "y"}])
+    out = tmp_path / "clean.html"
+    d.report(to=str(out))
+    assert "No data-quality warnings." in out.read_text(encoding="utf-8")
