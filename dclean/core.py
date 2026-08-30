@@ -1,7 +1,9 @@
 """Core fluent DataFrame wrapper for dclean."""
+import datetime
 import functools
 import glob
 import importlib
+import json
 import os
 import re
 import sys
@@ -308,6 +310,72 @@ def _html_report(profile, title="dclean profile"):
     return "\n".join(parts)
 
 
+# --------------------------------------------------------------------- RECIPES
+# A pipeline is worth replaying: the same cleaning, next month's file. The log
+# already knows what happened, but it knows it as display strings - and
+# "drop(['a', 'b'])" cannot be turned back into a call without a parser for
+# dclean's own repr, which would be wrong the first time a column name contains
+# a quote. So each step carries a STRUCTURED record beside its display string,
+# and replay reads the structure and ignores the prose.
+RECIPE_FORMAT = 1
+
+# Replayable: a pure function of the frame plus JSON-serializable arguments.
+# join()/concat() need a second table a recipe cannot carry; groupby().agg() is
+# two calls - .mean(col, by=...) is the one-call form that records.
+REPLAYABLE = frozenset((
+    "clean", "fix_nulls", "drop_outliers", "dropna", "fillna", "drop", "keep",
+    "rename", "dedupe", "astype", "lower_cols", "to_float", "filter", "mutate",
+    "select", "sort", "copy",
+    "stat", "mean", "sum", "count", "median", "min", "max",
+    "top", "bottom", "counts", "summarize", "corr",
+))
+
+_NOT_REPLAYABLE_HINT = {
+    "join": "join() needs the other table, which a recipe cannot carry",
+    "concat": "concat() needs the other sources, which a recipe cannot carry",
+    "groupby": "groupby().agg() is two calls - use .mean(col, by=...) "
+               "(or .sum/.count/...), which records as one",
+    "agg": "groupby().agg() is two calls - use .mean(col, by=...) "
+           "(or .sum/.count/...), which records as one",
+}
+
+
+def _step(display, method=None, args=None, kwargs=None):
+    """One entry in the pipeline log.
+
+    ``display`` is what a human reads; ``method``/``args``/``kwargs`` are what
+    a recipe replays. A step with no ``method`` is recorded but cannot replay.
+    """
+    return {
+        "display": display,
+        "method": method,
+        "args": list(args) if args else [],
+        "kwargs": dict(kwargs) if kwargs else {},
+    }
+
+
+def _as_step(step):
+    """Accept a step dict or a bare display string (the older shape)."""
+    return dict(step) if isinstance(step, dict) else _step(str(step))
+
+
+def _jsonable(value):
+    """True when ``value`` survives a JSON round trip unchanged."""
+    try:
+        return json.loads(json.dumps(value)) == value
+    except (TypeError, ValueError):
+        return False
+
+
+def _version():
+    """The installed dcleaner version, recorded in a recipe for provenance."""
+    try:
+        from . import __version__
+        return __version__
+    except Exception:  # pragma: no cover - partially initialised package
+        return "unknown"
+
+
 def _require(modules, what, install=None):
     """Import the first available of ``modules``, or say what to pip install.
 
@@ -371,20 +439,30 @@ class Data:
             raise TypeError(f"Data() can't handle source of type {type(source).__name__}")
         self._group = None
         self._fig = None
-        self._steps = list(steps) if steps else []
+        self._steps = [_as_step(s) for s in steps] if steps else []
 
     # ----------------------------------------------------------- INTERNAL
-    def _derive(self, df, step=None, group=None):
+    def _derive(self, df, step=None, group=None, call=None):
         """Build the next Data in the chain. Never touches ``self``.
 
         ``df`` is adopted as-is (pandas ops already return new frames), so a
         chain costs no redundant copies.
+
+        ``step`` is the line a human reads in ``log()``. ``call`` is the
+        ``(method, args, kwargs)`` a recipe replays - passed by the transform,
+        which already knows its own arguments, instead of being parsed back out
+        of the display string later. A transform with no ``call`` still logs;
+        it just cannot be replayed.
         """
         out = object.__new__(Data)
         out.df = df
         out._group = group
         out._fig = self._fig
-        out._steps = self._steps + ([step] if step else [])
+        entry = None
+        if step is not None:
+            method, args, kwargs = call if call else (None, (), {})
+            entry = _step(step, method, args, kwargs)
+        out._steps = self._steps + ([entry] if entry else [])
         return out
 
     # ----------------------------------------------------------- LOAD
@@ -667,12 +745,16 @@ class Data:
         else:
             print(f"{BOLD}pipeline{RESET}")
             for i, s in enumerate(self._steps, 1):
-                print(f"  {i}. {s}")
+                print(f"  {i}. {s['display']}")
         return self
 
     def steps(self):
-        """Return the applied-step log as a list of strings."""
-        return list(self._steps)
+        """Return the applied-step log as a list of strings.
+
+        Escape hatch: returns plain values. For the structured form a recipe
+        replays, use :meth:`save_recipe`.
+        """
+        return [s["display"] for s in self._steps]
 
     # ----------------------------------------------------------- AUTO
     def clean(self, nulls="keep", dates=True, verbose=True):
@@ -805,7 +887,8 @@ class Data:
             print(f"{BOLD}-> {before_rows}x{before_cols} to "
                   f"{df.shape[0]}x{df.shape[1]}, "
                   f"{int(df.isna().sum().sum())} nulls remaining{RESET}\n")
-        return self._derive(df, step=f"clean(nulls={nulls!r})")
+        return self._derive(df, step=f"clean(nulls={nulls!r})",
+                            call=("clean", (), {"nulls": nulls, "dates": bool(dates)}))
 
     @staticmethod
     def _dedupe_column_names(df):
@@ -853,7 +936,9 @@ class Data:
                     df[c] = df[c].fillna(mode.iloc[0])
             else:  # auto + numeric
                 df[c] = df[c].fillna(df[c].median())
-        return self._derive(df, step=f"fix_nulls({strategy!r})")
+        return self._derive(df, step=f"fix_nulls({strategy!r})",
+                            call=("fix_nulls", (), {"strategy": strategy,
+                                                    "subset": subset}))
 
     def drop_outliers(self, cols=None, method="iqr", factor=1.5):
         """Drop rows whose numeric values are statistical outliers.
@@ -883,39 +968,49 @@ class Data:
         removed = int((~mask).sum())
         print(f"{BOLD}-> dropped {removed} outlier rows ({method}){RESET}")
         return self._derive(df[mask].reset_index(drop=True),
-                            step=f"drop_outliers({method!r}, factor={factor})")
+                            step=f"drop_outliers({method!r}, factor={factor})",
+                            call=("drop_outliers", (), {"cols": cols,
+                                                        "method": method,
+                                                        "factor": factor}))
 
     # ----------------------------------------------------------- CLEAN
     def dropna(self, subset=None):
-        return self._derive(self.df.dropna(subset=subset), step="dropna()")
+        return self._derive(self.df.dropna(subset=subset), step="dropna()",
+                            call=("dropna", (), {"subset": subset}))
 
     def fillna(self, value):
-        return self._derive(self.df.fillna(value), step="fillna()")
+        return self._derive(self.df.fillna(value), step="fillna()",
+                            call=("fillna", (value,), {}))
 
     def drop(self, cols):
         cols = [cols] if isinstance(cols, str) else list(cols)
         return self._derive(self.df.drop(columns=cols),
-                            step=f"drop({cols})")
+                            step=f"drop({cols})",
+                            call=("drop", (cols,), {}))
 
     def keep(self, *cols):
         cols = [c for c in cols if isinstance(c, str)]
-        return self._derive(self.df[cols], step=f"keep({cols})")
+        return self._derive(self.df[cols], step=f"keep({cols})",
+                            call=("keep", cols, {}))
 
     def rename(self, **kwargs):
-        return self._derive(self.df.rename(columns=kwargs), step="rename()")
+        return self._derive(self.df.rename(columns=kwargs), step="rename()",
+                            call=("rename", (), kwargs))
 
     def dedupe(self, subset=None):
         return self._derive(self.df.drop_duplicates(subset=subset),
-                            step="dedupe()")
+                            step="dedupe()",
+                            call=("dedupe", (), {"subset": subset}))
 
     def astype(self, **kwargs):
-        return self._derive(self.df.astype(kwargs), step="astype()")
+        return self._derive(self.df.astype(kwargs), step="astype()",
+                            call=("astype", (), kwargs))
 
     def lower_cols(self):
         """Rename all columns to lowercase (common cleaning step)."""
         return self._derive(
             self.df.rename(columns={c: str(c).lower() for c in self.df.columns}),
-            step="lower_cols()")
+            step="lower_cols()", call=("lower_cols", (), {}))
 
     def to_float(self, *cols):
         """Convert string/object column(s) to float.
@@ -930,7 +1025,8 @@ class Data:
             df.select_dtypes(include="object").columns)
         for c in targets:
             df[c] = pd.to_numeric(_clean_numeric_strings(df[c]), errors="coerce")
-        return self._derive(df, step=f"to_float({list(targets)})")
+        return self._derive(df, step=f"to_float({list(targets)})",
+                            call=("to_float", tuple(cols), {}))
 
     # ----------------------------------------------------------- FILTER
     def filter(self, expr):
@@ -942,7 +1038,8 @@ class Data:
         resolves to score >= 70 and score <= 100.
         Columns with spaces must use back-ticks: filter("`total sales` > 100")
         """
-        return self._derive(self._apply_expr(expr), step=f"filter({expr!r})")
+        return self._derive(self._apply_expr(expr), step=f"filter({expr!r})",
+                            call=("filter", (expr,), {}))
 
     def _apply_expr(self, expr):
         """Return the frame filtered by ``expr`` (mask or query result)."""
@@ -973,7 +1070,8 @@ class Data:
         df = self.df.copy()
         for col, expr in kwargs.items():
             df[col] = self._eval_assign(df, expr) if isinstance(expr, str) else expr
-        return self._derive(df, step=f"mutate({list(kwargs)})")
+        return self._derive(df, step=f"mutate({list(kwargs)})",
+                            call=("mutate", (), kwargs))
 
     @staticmethod
     def _eval_assign(df, expr):
@@ -992,11 +1090,13 @@ class Data:
             return eval(expr, {"__builtins__": {}}, ns)  # noqa: S307
 
     def select(self, *cols):
-        return self._derive(self.df[list(cols)], step=f"select({list(cols)})")
+        return self._derive(self.df[list(cols)], step=f"select({list(cols)})",
+                            call=("select", cols, {}))
 
     def sort(self, by, ascending=True):
         return self._derive(self.df.sort_values(by, ascending=ascending),
-                            step=f"sort({by!r})")
+                            step=f"sort({by!r})",
+                            call=("sort", (by,), {"ascending": ascending}))
 
     # ----------------------------------------------------------- COMBINE
     @staticmethod
@@ -1248,7 +1348,8 @@ class Data:
                    else self.df.select_dtypes(include="number").agg(how).to_frame().T)
         else:
             out = pd.DataFrame([{f"{how}_{col}": getattr(self.df[col], how)()}])
-        return self._derive(out, step=f"stat({how!r}, {col!r}, by={by!r})")
+        return self._derive(out, step=f"stat({how!r}, {col!r}, by={by!r})",
+                            call=("stat", (how,), {"col": col, "by": by}))
 
     def mean(self, col=None, by=None):
         """``d.mean("price", by="city")`` - mean of a column, optionally grouped."""
@@ -1278,19 +1379,22 @@ class Data:
         """``d.top(5, "price")`` - the n highest rows by a column."""
         df = self.df if by is None else self.df.sort_values(by, ascending=False)
         return self._derive(df.head(n).reset_index(drop=True),
-                            step=f"top({n}, {by!r})")
+                            step=f"top({n}, {by!r})",
+                            call=("top", (), {"n": n, "by": by}))
 
     def bottom(self, n=5, by=None):
         """``d.bottom(5, "price")`` - the n lowest rows by a column."""
         df = self.df if by is None else self.df.sort_values(by, ascending=True)
         return self._derive(df.head(n).reset_index(drop=True),
-                            step=f"bottom({n}, {by!r})")
+                            step=f"bottom({n}, {by!r})",
+                            call=("bottom", (), {"n": n, "by": by}))
 
     def counts(self, col):
         """``d.counts("city")`` - frequency table for one column."""
         out = self.df[col].value_counts(dropna=False).reset_index()
         out.columns = [col, "count"]
-        return self._derive(out, step=f"counts({col!r})")
+        return self._derive(out, step=f"counts({col!r})",
+                            call=("counts", (col,), {}))
 
     def summarize(self, **kwargs):
         """Quick named stats. summarize(mean_sal='mean(salary)', n='count()')"""
@@ -1305,12 +1409,14 @@ class Data:
                     out[k] = len(self.df)
                 else:
                     out[k] = getattr(self.df, func)()
-        return self._derive(pd.DataFrame([out]), step=f"summarize({list(kwargs)})")
+        return self._derive(pd.DataFrame([out]), step=f"summarize({list(kwargs)})",
+                            call=("summarize", (), kwargs))
 
     def corr(self, method="pearson"):
         """Return the correlation matrix as a DataFrame."""
         return self._derive(self.df.corr(numeric_only=True, method=method),
-                            step=f"corr({method!r})")
+                            step=f"corr({method!r})",
+                            call=("corr", (), {"method": method}))
 
     def plot_corr(self, title="Correlation matrix", cmap="coolwarm", show=None):
         """Heatmap of the numeric correlation matrix.
@@ -1397,6 +1503,101 @@ class Data:
             raise RuntimeError("No figure to save. Call plot()/plot_corr() first.")
         return self
 
+    # ----------------------------------------------------------- RECIPES
+    def save_recipe(self, path):
+        """Write this pipeline to a JSON recipe another file can replay.
+
+        Output method: writes a file and returns the SAME object.
+
+            Data("jan.csv").clean().filter("units > 5").save_recipe("m.json")
+
+        Only whitelisted steps replay (see ``dclean.core.REPLAYABLE``). A step
+        that cannot - `join()`, `concat()`, `groupby().agg()` - is refused HERE,
+        naming the step, rather than dropped: a recipe that quietly skipped your
+        join would produce a different dataset without saying so.
+        """
+        steps = []
+        for i, s in enumerate(self._steps, 1):
+            method = s["method"]
+            if method not in REPLAYABLE:
+                hint = _NOT_REPLAYABLE_HINT.get(
+                    str(s["display"]).split("(")[0].split(".")[0], "")
+                raise ValueError(
+                    "step {} ({}) cannot be replayed{}. Remove it from the "
+                    "pipeline you save the recipe from, or save the recipe "
+                    "before it.".format(i, s["display"], " - " + hint if hint else ""))
+            for name, value in list(s["kwargs"].items()) + list(enumerate(s["args"])):
+                if not _jsonable(value):
+                    raise ValueError(
+                        "step {} ({}) has an argument that is not JSON - {!r}. "
+                        "A recipe is a plain file; pass column names and "
+                        "literals, not objects.".format(i, s["display"], value))
+            steps.append({"method": method, "args": s["args"],
+                          "kwargs": s["kwargs"], "display": s["display"]})
+
+        recipe = {
+            "recipe": RECIPE_FORMAT,
+            "dcleaner": _version(),
+            "created": datetime.datetime.now().isoformat(timespec="seconds"),
+            "steps": steps,
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(recipe, fh, indent=2)
+            fh.write("\n")
+        print(f"saved recipe -> {path} ({len(steps)} steps)")
+        return self
+
+    def apply_recipe(self, path, verbose=True):
+        """Replay a saved recipe onto this dataset. Returns a NEW ``Data``.
+
+        Transform: every step in the recipe runs in order, exactly as if you
+        had typed the calls, so the result carries the whole pipeline in its
+        own ``log()``::
+
+            Data("feb.csv").apply_recipe("monthly.json")
+
+        Only whitelisted methods run - the check is repeated here because the
+        file may have been edited since it was written - and an unknown method
+        is an error, never a silent skip.
+
+        SECURITY: `filter()` and `mutate()` steps are expressions that get
+        evaluated, so a recipe file is as trusted as a Python script. Run
+        recipes you wrote, not recipes you were sent.
+        """
+        with open(path, encoding="utf-8") as fh:
+            recipe = json.load(fh)
+        if not isinstance(recipe, dict) or "steps" not in recipe:
+            raise ValueError(f"{path} is not a dclean recipe (no 'steps' key)")
+        fmt = recipe.get("recipe")
+        if fmt != RECIPE_FORMAT:
+            raise ValueError(
+                f"{path} is recipe format {fmt!r}, this dcleaner reads "
+                f"{RECIPE_FORMAT}. Re-save it with the version that wrote it.")
+
+        out = self
+        for i, s in enumerate(recipe["steps"], 1):
+            method = s.get("method")
+            if method not in REPLAYABLE:
+                raise ValueError(
+                    "step {} of {} calls {!r}, which dclean will not replay. "
+                    "Replayable methods: {}".format(
+                        i, path, method, ", ".join(sorted(REPLAYABLE))))
+            args = list(s.get("args") or [])
+            kwargs = dict(s.get("kwargs") or {})
+            try:
+                out = getattr(out, method)(*args, **kwargs)
+            except Exception as e:
+                raise ValueError(
+                    "step {} of {} - {}({}) - failed on this data: {}".format(
+                        i, path, method,
+                        ", ".join([repr(a) for a in args]
+                                  + [f"{k}={v!r}" for k, v in kwargs.items()]),
+                        e))
+        if verbose:
+            print(f"{BOLD}-> replayed {len(recipe['steps'])} steps from "
+                  f"{path}{RESET}")
+        return out
+
     # ----------------------------------------------------------- EXPORT
     def to_csv(self, path):
         """Write the frame to CSV, no index column.
@@ -1461,7 +1662,7 @@ class Data:
 
     def copy(self):
         """An independent copy (rarely needed - transforms already copy)."""
-        return self._derive(self.df.copy(), step="copy()")
+        return self._derive(self.df.copy(), step="copy()", call=("copy", (), {}))
 
     # ----------------------------------------------------------- DUNDERS
     def __str__(self):

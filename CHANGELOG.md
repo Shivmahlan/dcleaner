@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Recipes - replay a pipeline on another file.** `save_recipe("monthly.json")`
+  writes the steps this `Data` was built from; `apply_recipe("monthly.json")`
+  replays them onto a different file:
+
+  ```python
+  Data("jan.csv").clean().filter("units > 5").save_recipe("monthly.json")
+  Data("feb.csv").apply_recipe("monthly.json")
+  ```
+
+  **Design.** `.steps()` records display strings - `"filter('units > 5')"` -
+  which are lossy: `"drop(['a', 'b'])"` and `"sort('a')"` cannot be turned back
+  into a call without writing a parser for dclean's own repr, and that parser
+  would be wrong the first time a column name contains a bracket or a quote.
+  So a structured record is kept **alongside** the display string rather than
+  parsed back out of it. Every step is now a dict - `method`, `args`, `kwargs`,
+  `display` - and `_derive()` takes the structured call from the transform that
+  already knows its own arguments. `steps()` still returns the same list of
+  strings it always did, and `log()` prints what it always printed.
+
+  **Only whitelisted methods replay.** The whitelist is the transforms that are
+  a pure function of the frame plus JSON-serializable arguments. `join()` and
+  `concat()` are NOT on it - they need a second table that a recipe cannot
+  carry - and neither is `groupby().agg()`, which is two calls; `save_recipe()`
+  refuses up front, naming the step and (for `groupby`) the one-call
+  `mean(col, by=...)` form that does record. The whitelist is checked again at
+  replay time, because the file may have been edited in between; an unknown
+  method is an error, never a silent skip.
+
+  **A recipe is code.** `filter()` and `mutate()` expressions are stored
+  verbatim and evaluated on replay, so a recipe file is as trusted as a Python
+  script - the existing `__` guard still applies, but it is a guard rail, not a
+  sandbox. Run recipes you wrote, not recipes you were sent.
+
 - **A command line: `dcleaner`.** `pip install dcleaner` now puts a `dcleaner`
   command on your PATH for the jobs that never needed a Python session:
   `dcleaner report FILE [--no-examples] [--html OUT]`,

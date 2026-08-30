@@ -1039,3 +1039,181 @@ def test_cli_entry_point_is_declared():
         pyproject = fh.read()
     assert '[project.scripts]' in pyproject
     assert 'dcleaner = "dclean.cli:main"' in pyproject
+
+
+# --------------------------------------------------------------------- RECIPES
+import json
+
+
+def test_recipe_round_trips_a_pipeline(tmp_path):
+    jan = tmp_path / "jan.csv"
+    jan.write_text("Units,City\n10,NY\n3,LA\n8,SF\n")
+    feb = tmp_path / "feb.csv"
+    feb.write_text("Units,City\n20,NY\n1,LA\n6,SF\n")
+    recipe = tmp_path / "monthly.json"
+
+    (Data(str(jan)).clean(verbose=False).filter("units > 5")
+        .save_recipe(str(recipe)))
+    out = Data(str(feb)).apply_recipe(str(recipe), verbose=False)
+
+    assert out.df["units"].tolist() == [20, 6]      # the filter really ran
+    assert "units" in out.df.columns                # clean() normalized names
+
+
+def test_recipe_file_matches_the_documented_schema(tmp_path):
+    recipe = tmp_path / "r.json"
+    Data(SAMPLE).dropna().filter("age > 18").save_recipe(str(recipe))
+    doc = json.loads(recipe.read_text())
+
+    assert doc["recipe"] == core.RECIPE_FORMAT
+    assert doc["dcleaner"] == __import__("dclean").__version__
+    assert "created" in doc
+    assert [s["method"] for s in doc["steps"]] == ["dropna", "filter"]
+    for step in doc["steps"]:
+        assert set(step) == {"method", "args", "kwargs", "display"}
+    assert doc["steps"][1]["args"] == ["age > 18"]
+
+
+def test_save_recipe_returns_self_and_apply_returns_a_new_object(tmp_path):
+    recipe = tmp_path / "r.json"
+    d = Data(SAMPLE).dropna()
+    assert d.save_recipe(str(recipe)) is d           # output method
+    replayed = Data(SAMPLE).apply_recipe(str(recipe), verbose=False)
+    assert replayed is not d                         # transform
+    assert isinstance(replayed, Data)
+
+
+def test_replayed_steps_show_up_in_the_new_log(tmp_path):
+    recipe = tmp_path / "r.json"
+    Data(SAMPLE).dropna().filter("age > 18").save_recipe(str(recipe))
+    out = Data(SAMPLE).apply_recipe(str(recipe), verbose=False)
+    assert out.steps() == ["dropna()", "filter('age > 18')"]
+
+
+def test_steps_still_returns_plain_strings():
+    d = Data(SAMPLE).dropna().filter("age > 18")
+    assert d.steps() == ["dropna()", "filter('age > 18')"]
+    assert all(isinstance(s, str) for s in d.steps())
+
+
+def test_display_string_is_recorded_but_never_parsed(tmp_path):
+    # replay reads the structure; an edited display line must change nothing
+    recipe = tmp_path / "r.json"
+    Data(SAMPLE).filter("age > 18").save_recipe(str(recipe))
+    doc = json.loads(recipe.read_text())
+    doc["steps"][0]["display"] = "filter('age > 999')  # a lie"
+    recipe.write_text(json.dumps(doc))
+    out = Data(SAMPLE).apply_recipe(str(recipe), verbose=False)
+    assert len(out) == len(Data(SAMPLE).filter("age > 18"))
+
+
+def test_recipe_survives_names_that_would_break_a_parser(tmp_path):
+    # the reason steps are structured: this column name has a quote and a bracket
+    nasty = "it's (a) column"
+    src = tmp_path / "nasty.csv"
+    pd.DataFrame({nasty: [1, 2, 3], "b": [1, 2, 3]}).to_csv(src, index=False)
+    recipe = tmp_path / "r.json"
+    Data(str(src)).drop([nasty]).save_recipe(str(recipe))
+    out = Data(str(src)).apply_recipe(str(recipe), verbose=False)
+    assert nasty not in out.df.columns
+    assert "b" in out.df.columns
+
+
+def test_save_recipe_refuses_a_join_instead_of_dropping_it(tmp_path):
+    left = tmp_path / "l.csv"
+    left.write_text("city,n\nNY,1\n")
+    right = tmp_path / "r.csv"
+    right.write_text("city,region\nNY,East\n")
+    d = Data(str(left)).join(str(right), on="city", verbose=False)
+    with pytest.raises(ValueError) as e:
+        d.save_recipe(str(tmp_path / "r.json"))
+    assert "cannot be replayed" in str(e.value)
+    assert "join" in str(e.value)
+
+
+def test_save_recipe_points_groupby_at_the_one_call_form(tmp_path):
+    d = Data(SAMPLE).dropna().groupby("city").agg("mean", "salary")
+    with pytest.raises(ValueError) as e:
+        d.save_recipe(str(tmp_path / "r.json"))
+    assert "mean(col, by=...)" in str(e.value)
+
+
+def test_the_one_call_aggregate_does_record(tmp_path):
+    recipe = tmp_path / "r.json"
+    Data(SAMPLE).dropna().mean("salary", by="city").save_recipe(str(recipe))
+    out = Data(SAMPLE).dropna().apply_recipe(str(recipe), verbose=False)
+    assert len(out) == 3                              # NY, LA, SF
+
+
+def test_apply_recipe_refuses_a_method_that_is_not_whitelisted(tmp_path):
+    recipe = tmp_path / "evil.json"
+    recipe.write_text(json.dumps({
+        "recipe": core.RECIPE_FORMAT,
+        "steps": [{"method": "to_csv", "args": ["/tmp/pwned.csv"],
+                   "kwargs": {}, "display": "to_csv(...)"}],
+    }))
+    with pytest.raises(ValueError) as e:
+        Data(SAMPLE).apply_recipe(str(recipe))
+    assert "will not replay" in str(e.value)
+    assert not os.path.exists("/tmp/pwned.csv")
+
+
+def test_apply_recipe_refuses_an_unknown_format(tmp_path):
+    recipe = tmp_path / "future.json"
+    recipe.write_text(json.dumps({"recipe": 99, "steps": []}))
+    with pytest.raises(ValueError) as e:
+        Data(SAMPLE).apply_recipe(str(recipe))
+    assert "recipe format" in str(e.value)
+
+
+def test_apply_recipe_refuses_a_file_that_is_not_a_recipe(tmp_path):
+    recipe = tmp_path / "notes.json"
+    recipe.write_text(json.dumps({"hello": "world"}))
+    with pytest.raises(ValueError) as e:
+        Data(SAMPLE).apply_recipe(str(recipe))
+    assert "not a dclean recipe" in str(e.value)
+
+
+def test_apply_recipe_says_which_step_failed(tmp_path):
+    recipe = tmp_path / "r.json"
+    Data(SAMPLE).dropna().filter("age > 18").save_recipe(str(recipe))
+    other = tmp_path / "other.csv"
+    other.write_text("height\n180\n")             # no 'age' column
+    with pytest.raises(ValueError) as e:
+        Data(str(other)).apply_recipe(str(recipe))
+    message = str(e.value)
+    assert "step 2" in message
+    assert "filter" in message
+
+
+def test_save_recipe_refuses_an_argument_that_is_not_json(tmp_path):
+    d = Data(SAMPLE).fillna(object())
+    with pytest.raises(ValueError) as e:
+        d.save_recipe(str(tmp_path / "r.json"))
+    assert "not JSON" in str(e.value)
+
+
+def test_recipe_replays_a_long_chain_faithfully(tmp_path):
+    src = tmp_path / "src.csv"
+    src.write_text(" Total Sales ,City,Units\n$1{sep}200.50,NY,10\n"
+                   "$300.00, la ,2\n$1{sep}200.50,NY,10\n".format(sep=","))
+    recipe = tmp_path / "r.json"
+    built = (Data(str(src)).clean(verbose=False)
+             .filter("units > 5")
+             .mutate(double="units * 2")
+             .sort("units", ascending=False)
+             .select("city", "units", "double"))
+    built.save_recipe(str(recipe))
+    replayed = Data(str(src)).apply_recipe(str(recipe), verbose=False)
+    pd.testing.assert_frame_equal(built.df.reset_index(drop=True),
+                                  replayed.df.reset_index(drop=True))
+
+
+def test_apply_recipe_announces_itself_unless_quiet(tmp_path, capsys):
+    recipe = tmp_path / "r.json"
+    Data(SAMPLE).dropna().save_recipe(str(recipe))
+    capsys.readouterr()
+    Data(SAMPLE).apply_recipe(str(recipe))
+    assert "replayed 1 steps" in capsys.readouterr().out
+    Data(SAMPLE).apply_recipe(str(recipe), verbose=False)
+    assert capsys.readouterr().out == ""

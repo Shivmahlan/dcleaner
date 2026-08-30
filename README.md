@@ -38,6 +38,7 @@ drops you back into full pandas whenever you outgrow the wrapper.
 - [Correlations](#correlations)
 - [Plotting](#plotting)
 - [Exporting](#exporting)
+- [Recipes](#recipes)
 - [Command reference](#command-reference)
 - [Full API reference](#full-api-reference)
 - [Why not just use pandas?](#why-not-just-use-pandas)
@@ -342,7 +343,7 @@ The rule is simple:
 |---|---|
 | Transforms — `clean` `dropna` `filter` `mutate` `agg` `join` `concat` … | a **new** `Data` |
 | Inspectors — `head` `report` `nulls` `describe` `log` … | the **same** object (they change nothing) |
-| Plot / output — `plot` `savefig` `to_csv` `to_excel` `to_json` `to_parquet` `show` | the **same** object |
+| Plot / output — `plot` `savefig` `to_csv` `to_excel` `to_json` `to_parquet` `save_recipe` `show` | the **same** object |
 | Escape hatches — `to_df` `to_fig` `steps` `len` `repr` | a plain value |
 
 > **Upgrading from 0.1.x?** Transforms used to modify in place, so
@@ -739,6 +740,75 @@ for anything `dclean` doesn't wrap yet.
 
 ---
 
+## Recipes
+
+You cleaned January. February is the same file with different rows — and next
+month there'll be another one. A **recipe** saves what your pipeline did so you
+can run it again on a different file:
+
+```python
+Data("jan.csv").clean().filter("units > 5").save_recipe("monthly.json")
+Data("feb.csv").apply_recipe("monthly.json")
+```
+
+`save_recipe()` is an output method (writes the file, returns the same object);
+`apply_recipe()` is a transform (returns a **new** `Data`). The replayed steps
+land in the new object's own `.log()`, so provenance survives the round trip:
+
+```python
+Data("feb.csv").apply_recipe("monthly.json").log()
+```
+```
+pipeline
+  1. clean(nulls='keep')
+  2. filter('units > 5')
+```
+
+The file is plain, reviewable JSON — it belongs in git next to the code that
+uses it:
+
+```json
+{
+  "recipe": 1,
+  "dcleaner": "0.3.0",
+  "created": "2026-08-30T12:58:29",
+  "steps": [
+    {"method": "clean",  "args": [],              "kwargs": {"nulls": "keep", "dates": true},
+     "display": "clean(nulls='keep')"},
+    {"method": "filter", "args": ["units > 5"],   "kwargs": {},
+     "display": "filter('units > 5')"}
+  ]
+}
+```
+
+`display` is there for you to read in a diff — **replay never parses it**, only
+`method`/`args`/`kwargs`. That's the whole reason steps are recorded
+structurally instead of being reverse-engineered from the log: a column named
+`it's (a) column` would defeat any parser of dclean's own repr.
+
+**Not everything replays.** The whitelist is the transforms that are a pure
+function of the frame plus plain arguments. `join()` and `concat()` need a
+second table a recipe can't carry, and `groupby().agg()` is two calls — so
+`save_recipe()` **refuses** rather than quietly dropping the step:
+
+```python
+d.groupby("city").agg("mean", "salary").save_recipe("r.json")
+# ValueError: step 2 (groupby(['city']).agg('mean', 'salary')) cannot be
+# replayed - groupby().agg() is two calls - use .mean(col, by=...) ...
+```
+
+A recipe that silently skipped your join would hand you a different dataset
+without saying so. Use the one-call form (`.mean("salary", by="city")`), which
+records as a single step, or save the recipe before the join.
+
+> ⚠️ **A recipe is code.** `filter()` and `mutate()` steps are expressions that
+> get evaluated on replay, exactly as if you had typed them. A recipe file is
+> as trusted as a Python script — run the ones you wrote, not ones you were
+> sent. The whitelist is checked again at replay time (the file may have been
+> edited), so an unknown method is an error, never a silent skip.
+
+---
+
 ## Command reference
 
 Every command, grouped by what you're trying to do. All of them chain.
@@ -781,6 +851,8 @@ d.nulls()         d.nulls(plot=True) # missing values per column (+ chart)
 d.report()                           # dtypes, nulls, dupes, stats, warnings
 d.report(to="profile.html")          # same profile, one self-contained file
 d.log()           d.steps()          # what this pipeline actually did
+d.save_recipe("r.json")              # save those steps...
+Data("feb.csv").apply_recipe("r.json")   # ...and replay them elsewhere
 print(d)          len(d)             # table render / row count
 ```
 
@@ -894,7 +966,7 @@ d.to_fig()                           # the matplotlib Figure - full matplotlib
 | Aggregate (longhand) | `.groupby(*c).agg(how, col)` `.summarize(**stats)` `.corr([method])` | |
 | Plot | `.plot(kind, [x], [y], [title], [show])` `.plot_corr([title], [show])` | line/bar/hist/scatter/box/pie; `x`/`y` inferred on a 2-column frame; `show=` overrides where it renders |
 | Output | `.show()` `.savefig(path)` `.to_csv(path)` `.to_excel(path)` `.to_json(path)` `.to_parquet(path)` `.to_df()` `.to_fig()` | `.show()`/`.plot()` render inline in notebooks, in a window from a script; `to_excel`/`to_parquet` need `openpyxl`/`pyarrow` |
-| Provenance | `.log()` `.steps()` | what the pipeline actually did |
+| Provenance | `.log()` `.steps()` `.save_recipe(path)` `.apply_recipe(path)` | what the pipeline did — and running it again on another file |
 
 Transform methods return a **new** `Data` (the original is untouched);
 inspect, plot and output methods return the **same** object; `.to_df()`,
