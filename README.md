@@ -391,6 +391,7 @@ Data.from_records([{"name": "a", "val": 1}, {"name": "b", "val": 2}])
 
 ```python
 d = Data("sales.csv")
+d                   # in a notebook: renders as a table (see below)
 d.head()            # first 5 rows
 d.head(10)          # first 10 rows
 d.tail()            # last 5 rows
@@ -407,6 +408,55 @@ d.nulls()           # missing-value counts per column (+ total)
 d.report()          # FULL profile: dtypes, nulls, dupes, stats, warnings
 d.report(to="p.html")  # ...the same profile as one shareable HTML file
 d.log()             # the pipeline steps that produced this frame
+```
+
+### In a notebook
+
+A bare `Data` at the end of a cell now renders as a real table — a header line
+with the shape, then the first 10 rows — instead of the one-line repr:
+
+```python
+d = Data("sales.csv")
+d
+```
+
+> **dclean.Data** — 60 rows × 4 cols — showing the first 10
+>
+> | | city | age | salary | score |
+> |---|---|---|---|---|
+> | **0** | NY | 56.0 | NaN | 54.807467 |
+> | **1** | SF | 48.0 | NaN | 54.465312 |
+> | **…** | | | | |
+
+The terminal is deliberately unchanged — `repr()` stays terse and `print()`
+still prints the whole table, so nothing about scripts or the REPL moved:
+
+```python
+>>> repr(d)
+'dclean.Data(60x4, cols=[city, age, salary, score])'
+>>> print(d)          # still the full table
+```
+
+### Output you can pipe
+
+Headings are bold and underlined on a terminal and **plain text everywhere
+else**, so a redirected report is a clean file rather than one full of
+`\033[1m`:
+
+```bash
+python analysis.py                    # bold headings on screen
+python analysis.py > profile.txt      # plain text in the file
+dcleaner report sales.csv | less      # plain text through the pipe
+```
+
+The decision is made **once, when `dclean` is imported**, from wherever stdout
+points at that moment — so it costs nothing per print. Both standard overrides
+are honoured:
+
+```bash
+NO_COLOR=1 dcleaner report sales.csv            # never colour, even on a terminal
+FORCE_COLOR=1 dcleaner report sales.csv | less -R   # colour anyway, through a pipe
+FORCE_COLOR=0 dcleaner report sales.csv         # force it off
 ```
 
 ---
