@@ -1329,6 +1329,11 @@ class Data:
         if self is not None:
             labels[0] = "this data"
         if source_col:
+            clash = [lab for lab, f in zip(labels, frames) if source_col in f.columns]
+            if clash:  # overwriting it would destroy real data, silently
+                raise ValueError(
+                    f"source_col={source_col!r} is already a column in "
+                    f"{', '.join(clash)} - pick a name that is not in use")
             frames = [f.assign(**{source_col: lab}) for f, lab in zip(frames, labels)]
 
         cols = []

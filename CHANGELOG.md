@@ -134,6 +134,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   from. Reports the column that is missing from one source and the column whose
   type changes between sources - the two things that quietly ruin a stacked
   dataset.
+- **A second bundled dataset, `sample_cities.csv`** - a clean city lookup table
+  to join `sample_sales.csv` against, so the join examples run straight after
+  `pip install` like everything else in the README.
 - `show=` on `plot()`, `plot_corr()` and `nulls(plot=True)`: `None` (default)
   picks the sensible thing for where you are running, `True` displays it now,
   `False` builds the figure without displaying it.
