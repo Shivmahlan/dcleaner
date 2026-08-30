@@ -13,3 +13,6 @@ dist/
 .venv/
 venv/
 .DS_Store
+# Claude Code session state and worktrees. A worktree here is a nested
+# git repo, so `git add -A` would otherwise stage it as a bare gitlink.
+.claude/
