@@ -892,3 +892,150 @@ def test_html_report_says_so_when_there_is_nothing_to_warn_about(tmp_path):
     out = tmp_path / "clean.html"
     d.report(to=str(out))
     assert "No data-quality warnings." in out.read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------------- CLI
+# Driven through main(argv) rather than a subprocess: the exit code and the
+# streams are the contract, and a subprocess would only test pip's shim.
+from dclean import cli
+
+
+def test_cli_report_prints_a_profile(capsys):
+    assert cli.main(["report", SAMPLE]) == 0
+    out = capsys.readouterr().out
+    assert "DATASET REPORT" in out
+    assert "duplicate rows" in out
+
+
+def test_cli_report_can_hide_real_values(capsys, tmp_path):
+    src = tmp_path / "people.csv"
+    src.write_text("email\nalice@example.com\nbob@example.com\n")
+    assert cli.main(["report", str(src), "--no-examples"]) == 0
+    out = capsys.readouterr().out
+    assert "alice@example.com" not in out
+    assert "<str>" in out
+
+
+def test_cli_report_writes_html(tmp_path, capsys):
+    out = tmp_path / "profile.html"
+    assert cli.main(["report", SAMPLE, "--html", str(out)]) == 0
+    assert out.exists()
+    html = out.read_text(encoding="utf-8")
+    assert html.startswith("<!doctype html>")
+    assert "DATASET REPORT" not in capsys.readouterr().out  # written, not printed
+
+
+def test_cli_report_html_honours_no_examples(tmp_path):
+    src = tmp_path / "people.csv"
+    src.write_text("email\nalice@example.com\nbob@example.com\n")
+    out = tmp_path / "profile.html"
+    assert cli.main(["report", str(src), "--no-examples", "--html", str(out)]) == 0
+    assert "alice@example.com" not in out.read_text(encoding="utf-8")
+
+
+def test_cli_clean_writes_the_cleaned_file(tmp_path, capsys):
+    out = tmp_path / "clean.csv"
+    assert cli.main(["clean", "sample_sales.csv", "-o", str(out)]) == 0
+    assert "CLEAN" in capsys.readouterr().out
+    cleaned = Data(str(out))
+    assert "order_id" in cleaned.df.columns          # names normalized
+    assert not cleaned.df.duplicated().any()         # duplicates gone
+
+
+def test_cli_clean_nulls_strategy(tmp_path):
+    out = tmp_path / "clean.csv"
+    assert cli.main(["clean", "sample_sales.csv", "--nulls", "drop",
+                     "-o", str(out), "-q"]) == 0
+    assert Data(str(out)).df.isna().sum().sum() == 0
+
+
+def test_cli_clean_quiet_prints_nothing(capsys, tmp_path):
+    out = tmp_path / "clean.csv"
+    assert cli.main(["clean", "sample_sales.csv", "-o", str(out), "-q"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_cli_clean_no_dates_leaves_dates_as_text(tmp_path):
+    out = tmp_path / "clean.csv"
+    assert cli.main(["clean", "sample_sales.csv", "--no-dates",
+                     "-o", str(out), "-q"]) == 0
+    # order_date stays text, so it round-trips through csv as an object column
+    assert not pd.api.types.is_datetime64_any_dtype(Data(str(out)).df["order_date"])
+
+
+def test_cli_clean_writes_every_format_it_can_read(tmp_path):
+    pytest.importorskip("pyarrow")
+    out = tmp_path / "clean.parquet"
+    assert cli.main(["clean", "sample_sales.csv", "-o", str(out), "-q"]) == 0
+    assert Data(str(out)).df.shape[0] > 0
+
+
+def test_cli_clean_rejects_an_output_it_cannot_write(tmp_path, capsys):
+    out = tmp_path / "clean.txt"
+    assert cli.main(["clean", "sample_sales.csv", "-o", str(out), "-q"]) == 1
+    err = capsys.readouterr().err
+    assert "don't know how to write" in err
+    assert not out.exists()
+
+
+def test_cli_head_shows_n_rows(capsys):
+    assert cli.main(["head", SAMPLE, "-n", "3"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("\n") <= 6          # header + separator + 3 rows
+    for col in Data(SAMPLE).df.columns:
+        assert col in out
+
+
+def test_cli_head_defaults_to_five_rows(capsys):
+    assert cli.main(["head", SAMPLE]) == 0
+    assert capsys.readouterr().out.strip().count("\n") == 6
+
+
+def test_cli_missing_file_is_one_line_not_a_traceback(capsys):
+    assert cli.main(["report", "definitely_not_here.csv"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.strip() == "dcleaner: no such file: definitely_not_here.csv"
+    assert "Traceback" not in captured.err
+
+
+def test_cli_unsupported_file_type_is_one_line_not_a_traceback(tmp_path, capsys):
+    junk = tmp_path / "notes.txt"
+    junk.write_text("hello")
+    assert cli.main(["head", str(junk)]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.count("\n") == 1
+    assert "Unsupported file type" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_cli_version_flag_matches_the_package(capsys):
+    import dclean
+    with pytest.raises(SystemExit) as e:
+        cli.main(["--version"])
+    assert e.value.code == 0
+    assert dclean.__version__ in capsys.readouterr().out
+
+
+def test_cli_with_no_command_prints_help(capsys):
+    assert cli.main([]) == 0
+    out = capsys.readouterr().out
+    assert "usage:" in out
+    for command in ("report", "clean", "head"):
+        assert command in out
+
+
+def test_cli_rejects_an_unknown_nulls_strategy(capsys):
+    with pytest.raises(SystemExit) as e:
+        cli.main(["clean", "sample_sales.csv", "--nulls", "nonsense"])
+    assert e.value.code == 2                       # argparse's own usage error
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_cli_entry_point_is_declared():
+    # the [project.scripts] name is what `pip install dcleaner` puts on PATH
+    root = os.path.dirname(HERE)
+    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+        pyproject = fh.read()
+    assert '[project.scripts]' in pyproject
+    assert 'dcleaner = "dclean.cli:main"' in pyproject

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **A command line: `dcleaner`.** `pip install dcleaner` now puts a `dcleaner`
+  command on your PATH for the jobs that never needed a Python session:
+  `dcleaner report FILE [--no-examples] [--html OUT]`,
+  `dcleaner clean FILE [-o OUT] [--nulls keep|drop|fill] [--no-dates] [-q]` and
+  `dcleaner head FILE [-n N]`, plus `--version`. Each subcommand is a thin
+  wrapper over `dclean.report` / `dclean.clean` / `Data`, so the terminal and
+  the library cannot disagree. `-o` picks its writer from the extension
+  (csv/xlsx/json/parquet). It behaves like a shell tool: exit 0 on success,
+  exit 1 with ONE line on stderr for a missing file, an unreadable file type or
+  an output extension it cannot write - a traceback would mean a bug in dclean,
+  not a typo in a filename. Built on stdlib `argparse`; no new dependency.
 - **`report(to="profile.html")` - a profile you can send to someone.** The same
   per-column dtypes, null counts, unique counts, duplicate count, numeric stats
   and warnings the terminal prints, written as ONE self-contained HTML file:

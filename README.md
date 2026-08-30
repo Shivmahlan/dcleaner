@@ -26,6 +26,7 @@ drops you back into full pandas whenever you outgrow the wrapper.
 - [The idea](#the-idea)
 - [Quick start](#quick-start)
 - [The toolkit: just tell it](#the-toolkit-just-tell-it)
+- [From the shell](#from-the-shell)
 - [Transforms never mutate](#transforms-never-mutate)
 - [Loading data](#loading-data)
 - [Inspecting](#inspecting)
@@ -262,6 +263,50 @@ dclean.report("sample_sales.csv")
 
 It is deliberately messy — padded column names, `$1,234.50` prices, `"n/a"`
 units, an empty column, duplicate rows — so `clean()` has something to do.
+
+---
+
+## From the shell
+
+Some jobs never need a Python session. `pip install dcleaner` puts a `dcleaner`
+command on your PATH, and every subcommand is a thin wrapper over the API of
+the same name — so the terminal and the library can never disagree about what
+"clean" means.
+
+```bash
+dcleaner report sales.csv                        # full data-quality profile
+dcleaner report sales.csv --no-examples          # ...with no real values in it
+dcleaner report sales.csv --html profile.html    # ...as a shareable HTML file
+
+dcleaner clean messy.csv                         # clean it, say what changed
+dcleaner clean messy.csv -o clean.csv            # ...and write it out
+dcleaner clean messy.csv -o clean.parquet --nulls fill -q
+
+dcleaner head sales.csv -n 20                    # peek at the first 20 rows
+dcleaner --version
+```
+
+| Command | Flags |
+|---|---|
+| `dcleaner report FILE` | `--no-examples` (show types, not your values) · `--html OUT` (self-contained file) |
+| `dcleaner clean FILE` | `-o/--out OUT` (csv/xlsx/json/parquet) · `--nulls keep\|drop\|fill` · `--no-dates` · `-q/--quiet` |
+| `dcleaner head FILE` | `-n N` (default 5) |
+
+It behaves like a shell tool should: **exit 0** on success, **exit 1** with one
+line on stderr for anything you can fix — a missing file, a file type `dclean`
+doesn't read, an output extension it can't write. A traceback means a bug in
+`dclean`, not a typo in a filename.
+
+```bash
+$ dcleaner report nope.csv
+dcleaner: no such file: nope.csv
+$ echo $?
+1
+```
+
+Piped output is plain text — the bold/underline escapes are dropped
+automatically when stdout isn't a terminal, so `dcleaner report x.csv > profile.txt`
+gives you a clean file. `NO_COLOR` and `FORCE_COLOR` are both respected.
 
 ---
 
