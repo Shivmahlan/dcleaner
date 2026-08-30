@@ -346,6 +346,20 @@ The rule is simple:
 | Plot / output — `plot` `savefig` `to_csv` `to_excel` `to_json` `to_parquet` `save_recipe` `show` | the **same** object |
 | Escape hatches — `to_df` `to_fig` `steps` `len` `repr` | a plain value |
 
+**Type hints ship with the package.** `dclean` includes a `py.typed` marker, so
+`mypy`, `pyright` and your editor read the annotations on the public API
+straight from the installed package — no stub package, no `# type: ignore`:
+
+```python
+d: Data = Data("sales.csv").clean()     # -> Data
+df: pd.DataFrame = d.to_df()            # -> DataFrame, the escape hatch
+names: List[str] = d.steps()            # -> List[str]
+```
+
+Transforms are annotated as returning `Data`, inspectors and output methods the
+same, and the escape hatches their real types — the contract in the table above,
+enforced by your checker.
+
 > **Upgrading from 0.1.x?** Transforms used to modify in place, so
 > `d.to_float("price")` worked as a statement. Now you must bind the result:
 > `d = d.to_float("price")`. Anything already written as a single chain is
@@ -646,6 +660,37 @@ d.plot("scatter",x="age",    y="salary")               # scatter
 d.plot("box",    x="city",   y="salary")               # boxplot
 d.plot("pie",    x="city",   y="salary")               # pie chart
 ```
+
+### Colours you can actually tell apart
+
+Around 1 in 12 men cannot separate matplotlib's default red from its green, so
+`dclean` doesn't draw with them. Charts use the **Okabe-Ito** qualitative set —
+eight hues chosen to stay distinct under the common colour-vision deficiencies,
+and still separable in greyscale when someone prints it:
+
+```python
+d.plot("bar", x="city", y="salary")     # first series is #0072B2, then #E69F00, ...
+```
+
+`plot_corr()` uses a **diverging** map (`RdBu_r` — blue/red, never red/green)
+pinned to `-1..+1`, so the neutral colour always means *no correlation*. On an
+auto-scaled heatmap the midpoint lands wherever the data happens to sit, which
+reads as a lie:
+
+```python
+d.plot_corr()                       # blue = negative, red = positive, white = 0
+```
+
+Both are **defaults, not decisions** — anything you pass wins:
+
+```python
+d.plot("bar", x="city", y="salary", color="red")     # your colour
+d.plot("line", x="date", y="revenue", colormap="viridis")
+d.plot_corr(cmap="coolwarm")                         # the old default, if you liked it
+```
+
+The palette is scoped to the call, so importing `dclean` changes nothing about
+any other plotting you do in the same session.
 
 ### Where the chart appears
 

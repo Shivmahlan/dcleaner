@@ -27,7 +27,7 @@ class CliError(Exception):
     """A problem the user can fix: exits 1 with one line, never a traceback."""
 
 
-def _load(path):
+def _load(path: str) -> Data:
     """Load ``path`` into a ``Data``, turning the usual failures into CliError."""
     try:
         return Data(path)
@@ -41,7 +41,7 @@ def _load(path):
         raise CliError(str(e))
 
 
-def _build_parser():
+def _build_parser() -> argparse.ArgumentParser:
     """The argparse parser. Stdlib only - no dependency for a convenience."""
     parser = argparse.ArgumentParser(
         prog="dcleaner",
@@ -90,7 +90,7 @@ def _build_parser():
     return parser
 
 
-def _write(data, path):
+def _write(data: Data, path: str) -> Data:
     """Write ``data`` to ``path``, picking the writer from the suffix."""
     lowered = str(path).lower()
     if lowered.endswith((".csv", ".csv.gz")):
@@ -106,13 +106,13 @@ def _write(data, path):
         ".parquet".format(path))
 
 
-def _cmd_report(args):
+def _cmd_report(args: argparse.Namespace) -> int:
     d = _load(args.file)
     d.report(examples=not args.no_examples, to=args.html)
     return 0
 
 
-def _cmd_clean(args):
+def _cmd_clean(args: argparse.Namespace) -> int:
     d = _load(args.file).clean(nulls=args.nulls, dates=not args.no_dates,
                                verbose=not args.quiet)
     if args.out:
@@ -127,7 +127,7 @@ def _cmd_clean(args):
     return 0
 
 
-def _cmd_head(args):
+def _cmd_head(args: argparse.Namespace) -> int:
     _load(args.file).head(args.n)
     return 0
 

@@ -38,4 +38,5 @@ py-modules = ["dcleaner"]
 include-package-data = true
 
 [tool.setuptools.package-data]
+dclean = ["py.typed"]
 "dclean.data" = ["*.csv"]

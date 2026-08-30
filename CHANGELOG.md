@@ -6,7 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Charts are drawn in colours people can actually tell apart.** Roughly 1 in
+  12 men cannot separate matplotlib's default red from its green, so `plot()`
+  and `nulls(plot=True)` now use the **Okabe-Ito** qualitative set - eight hues
+  that stay distinct under the common colour-vision deficiencies and in
+  greyscale. `plot_corr()` swaps `coolwarm` for `RdBu_r`, a CVD-safe diverging
+  map, and pins the scale to `-1..+1` so the neutral colour always means "no
+  correlation" - on an auto-scaled heatmap the midpoint landed wherever the
+  data happened to sit. Both are defaults, not decisions: an explicit `color=`,
+  `colormap=` or `cmap=` always wins. The palette is applied through a scoped
+  `rc_context` rather than a global rcParams change - importing dclean still
+  changes nothing about anyone else's plots - which also fixes the case an
+  axes-level cycle silently misses, since pandas reads the cycle from rcParams
+  when it draws a bar or a pie.
+
 ### Added
+- **Type hints on the public API, with a `py.typed` marker.** mypy, pyright and
+  editors now read dclean's annotations straight from the installed package -
+  no stubs, no `# type: ignore`. Transforms are typed as returning `Data`, the
+  escape hatches their real types (`to_df() -> DataFrame`,
+  `steps() -> List[str]`, `to_fig() -> Figure`). Annotations use
+  `typing.Optional`/`List`/`Union` so the package still imports on Python 3.8.
 - **Recipes - replay a pipeline on another file.** `save_recipe("monthly.json")`
   writes the steps this `Data` was built from; `apply_recipe("monthly.json")`
   replays them onto a different file:

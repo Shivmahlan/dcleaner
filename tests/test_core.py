@@ -1217,3 +1217,96 @@ def test_apply_recipe_announces_itself_unless_quiet(tmp_path, capsys):
     assert "replayed 1 steps" in capsys.readouterr().out
     Data(SAMPLE).apply_recipe(str(recipe), verbose=False)
     assert capsys.readouterr().out == ""
+
+
+# ------------------------------------------------------------------- TYPING
+def test_py_typed_marker_ships_with_the_package():
+    import dclean
+    marker = os.path.join(os.path.dirname(dclean.__file__), "py.typed")
+    assert os.path.exists(marker), "py.typed is what tells a checker to read our hints"
+
+
+def test_py_typed_is_declared_as_package_data():
+    root = os.path.dirname(HERE)
+    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+        pyproject = fh.read()
+    # without this the marker exists in the repo but never reaches the wheel
+    assert 'dclean = ["py.typed"]' in pyproject
+
+
+def test_public_methods_carry_type_hints():
+    import inspect
+    skip = {"samples"}                     # staticmethod with no self to bind
+    missing = []
+    for name in dir(Data):
+        if name.startswith("_") or name in skip:
+            continue
+        member = inspect.getattr_static(Data, name)
+        func = member.__func__ if isinstance(member, (staticmethod, classmethod)) \
+            else getattr(member, "func", member)
+        if not inspect.isfunction(func):
+            continue
+        if inspect.signature(func).return_annotation is inspect.Signature.empty:
+            missing.append(name)
+    assert not missing, "public methods with no return annotation: %s" % missing
+
+
+def test_the_version_is_the_same_in_both_places():
+    import dclean
+    root = os.path.dirname(HERE)
+    with open(os.path.join(root, "pyproject.toml"), encoding="utf-8") as fh:
+        pyproject = fh.read()
+    assert 'version = "%s"' % dclean.__version__ in pyproject
+
+
+# ------------------------------------------------------------- PLOT COLOURS
+def test_plots_use_the_colourblind_safe_cycle():
+    d = Data.from_records([{"city": "NY", "n": 3}, {"city": "LA", "n": 1},
+                           {"city": "SF", "n": 4}])
+    line = d.plot("line", x="city", y="n", show=False).to_fig()
+    assert line.axes[0].lines[0].get_color() == core.OKABE_ITO[0]
+
+    # pandas reads the cycle from rcParams when it draws a bar, so this is the
+    # case an axes-level prop_cycle would silently miss
+    bar = d.plot("bar", x="city", y="n", show=False).to_fig()
+    facecolor = bar.axes[0].patches[0].get_facecolor()
+    assert matplotlib.colors.to_hex(facecolor).upper() == core.OKABE_ITO[0]
+
+
+def test_a_second_series_gets_the_next_okabe_ito_colour():
+    d = Data.from_records([{"city": "NY", "n": 3, "m": 5},
+                           {"city": "LA", "n": 1, "m": 2}])
+    fig = d.plot("line", x="city", show=False).to_fig()
+    colours = [line.get_color() for line in fig.axes[0].lines]
+    assert colours == list(core.OKABE_ITO[:2])
+
+
+def test_an_explicit_colour_beats_the_default():
+    d = Data.from_records([{"city": "NY", "n": 3}, {"city": "LA", "n": 1}])
+    fig = d.plot("line", x="city", y="n", color="red", show=False).to_fig()
+    assert fig.axes[0].lines[0].get_color() == "red"
+
+
+def test_the_palette_does_not_leak_into_global_state():
+    before = matplotlib.rcParams["axes.prop_cycle"]
+    Data.from_records([{"a": 1}, {"a": 2}]).plot("line", y="a", show=False)
+    assert matplotlib.rcParams["axes.prop_cycle"] == before
+
+
+def test_plot_corr_uses_a_diverging_map_anchored_at_zero():
+    fig = Data(SAMPLE).dropna().plot_corr(show=False).to_fig()
+    image = fig.axes[0].images[0]
+    assert image.get_cmap().name == core.DIVERGING
+    assert image.get_clim() == (-1.0, 1.0)   # midpoint really is "no correlation"
+
+
+def test_plot_corr_cmap_is_still_overridable():
+    fig = Data(SAMPLE).dropna().plot_corr(cmap="viridis", show=False).to_fig()
+    assert fig.axes[0].images[0].get_cmap().name == "viridis"
+
+
+def test_the_palette_is_the_okabe_ito_set():
+    # eight hues, all distinct, all valid colours
+    assert len(core.OKABE_ITO) == len(set(core.OKABE_ITO)) == 8
+    for colour in core.OKABE_ITO:
+        matplotlib.colors.to_rgb(colour)     # raises if it is not a colour

@@ -5,15 +5,18 @@ Two ways in:
     from dclean import Data          # the fluent, chainable object
     import dclean; dclean.clean(...) # one-call helpers ("just tell it")
 """
+from typing import Any, Optional
+
 from .core import Data
 
 
-def load(source):
+def load(source: Any) -> Data:
     """Load any supported file into a ``Data``. ``dclean.load("sales.csv")``"""
     return Data(source)
 
 
-def clean(source, to=None, nulls="keep", verbose=True):
+def clean(source: Any, to: Optional[str] = None, nulls: str = "keep",
+          verbose: bool = True) -> Data:
     """Load a file, auto-clean it, and optionally write it back out.
 
     The whole job in one call - you name the file, the library works out the
@@ -31,7 +34,7 @@ def clean(source, to=None, nulls="keep", verbose=True):
     return d
 
 
-def report(source):
+def report(source: Any) -> Data:
     """Load a file and print a full data-quality profile of it.
 
         import dclean

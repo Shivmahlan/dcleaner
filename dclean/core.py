@@ -1,4 +1,5 @@
 """Core fluent DataFrame wrapper for dclean."""
+import contextlib
 import datetime
 import functools
 import glob
@@ -8,9 +9,11 @@ import os
 import re
 import sys
 from html import escape as _escape
+from typing import Any, List, Optional, Union
 import pandas as pd
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 
 # Show every column (no "..." truncation) on any raw pandas print.
 pd.set_option("display.max_columns", None)
@@ -140,6 +143,39 @@ def _render(fig, show):
     elif mode == "notebook":
         plt.close(fig)  # show=False means show=False, even in a notebook
     return fig
+
+
+# A chart nobody can read is a chart that failed. Roughly 1 in 12 men cannot
+# separate matplotlib's default red from its green, so dclean draws with the
+# Okabe-Ito qualitative set - eight hues chosen to stay distinct under the
+# common colour-vision deficiencies, and in greyscale when it is printed.
+OKABE_ITO = ("#0072B2", "#E69F00", "#009E73", "#CC79A7",
+             "#56B4E9", "#D55E00", "#F0E442", "#000000")
+
+# Correlations run -1..+1, so the map has to diverge about zero and be equally
+# readable either side of it. RdBu_r is ColorBrewer's CVD-safe diverging pair
+# (blue/red, never red/green) with lightness symmetric about the midpoint -
+# unlike coolwarm, whose ends carry different perceived weight.
+DIVERGING = "RdBu_r"
+
+# If any of these were passed, the caller has chosen the colours themselves.
+_COLOR_KWARGS = ("color", "colors", "colormap", "cmap", "c", "style")
+
+
+def _palette(kwargs=None):
+    """Draw inside the Okabe-Ito cycle - unless the caller picked colours.
+
+    Scoped to the ``with`` block rather than set on the axes: pandas reads the
+    cycle from ``rcParams`` when it draws a bar or a pie, so an axes-level
+    cycle is silently ignored for exactly the chart types people use most. It
+    is a context manager rather than a global so importing dclean still changes
+    nothing about anybody else's plots.
+
+    A default is a default: an explicit ``color=`` / ``colormap=`` always wins.
+    """
+    if kwargs and any(k in kwargs for k in _COLOR_KWARGS):
+        return contextlib.nullcontext()
+    return plt.rc_context({"axes.prop_cycle": plt.cycler(color=list(OKABE_ITO))})
 
 
 def _listify(x):
@@ -426,7 +462,9 @@ class Data:
     with ``.to_df()``.
     """
 
-    def __init__(self, source=None, df=None, steps=None):
+    def __init__(self, source: Optional[Union[str, pd.DataFrame]] = None,
+                 df: Optional[pd.DataFrame] = None,
+                 steps: Optional[List[Any]] = None) -> None:
         if df is not None:
             self.df = df.copy()
         elif isinstance(source, pd.DataFrame):
@@ -492,12 +530,12 @@ class Data:
         raise ValueError(f"Unsupported file type: {path}")
 
     @classmethod
-    def from_records(cls, records):
+    def from_records(cls, records: List[dict]) -> "Data":
         """Build from a list of dicts."""
         return cls(df=pd.DataFrame(records))
 
     @staticmethod
-    def samples():
+    def samples() -> List[str]:
         """List the dataset names bundled with the package."""
         here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
         names = sorted(f for f in os.listdir(here) if f.endswith(".csv"))
@@ -505,17 +543,17 @@ class Data:
         return names
 
     # ----------------------------------------------------------- INSPECT
-    def head(self, n=5):
+    def head(self, n: int = 5) -> "Data":
         print(tabulate(self.df.head(n), headers="keys", tablefmt="github",
                        showindex=False))
         return self
 
-    def tail(self, n=5):
+    def tail(self, n: int = 5) -> "Data":
         print(tabulate(self.df.tail(n), headers="keys", tablefmt="github",
                        showindex=False))
         return self
 
-    def to_table(self, max_rows=None):
+    def to_table(self, max_rows: Optional[int] = None) -> "Data":
         """Render the FULL dataset as a formatted table (no column truncation).
 
         Pass ``max_rows`` to cap the number of printed rows - every column is
@@ -526,7 +564,7 @@ class Data:
         print(tabulate(df, headers="keys", tablefmt="github", showindex=False))
         return self
 
-    def print(self, n=None):
+    def print(self, n: Optional[int] = None) -> "Data":
         """Print the dataset itself (chainable).
 
         No argument -> print the FULL frame. Pass ``n`` to cap to the first
@@ -545,11 +583,11 @@ class Data:
         print(tabulate(df, headers="keys", tablefmt="github", showindex=False))
         return self
 
-    def info(self):
+    def info(self) -> "Data":
         self.df.info()
         return self
 
-    def shape(self):
+    def shape(self) -> "Data":
         """Print the shape, the column list, and each feature's dtype."""
         print(f"{self.df.shape[0]} rows x {self.df.shape[1]} cols")
         print("columns:", list(self.df.columns))
@@ -557,7 +595,7 @@ class Data:
         print(self.df.dtypes.to_string())
         return self
 
-    def dtypes(self):
+    def dtypes(self) -> "Data":
         """Print each feature's data type (a tidy ``column -> dtype`` list).
 
         For just the raw pandas Series, use ``.to_df().dtypes``.
@@ -565,11 +603,11 @@ class Data:
         print(self.df.dtypes.to_string())
         return self
 
-    def cols(self):
+    def cols(self) -> "Data":
         print(list(self.df.columns))
         return self
 
-    def describe(self):
+    def describe(self) -> "Data":
         """Pretty, highlighted summary of numeric columns.
 
         Prints a banner + a tidy table, then calls out the headline statistic
@@ -595,7 +633,7 @@ class Data:
             print(f"{BOLD}-> mean | {callout}{RESET}\n")
         return self
 
-    def nulls(self, plot=False, show=None):
+    def nulls(self, plot: bool = False, show: Optional[bool] = None) -> "Data":
         """Show missing-value counts per column (and the total).
 
         Returns the same object so it can sit in a chain right before
@@ -613,8 +651,10 @@ class Data:
                        showindex=False))
         print(f"{BOLD}-> total nulls: {total} across {len(self.df)} rows{RESET}")
         if plot:
-            fig, ax = plt.subplots(figsize=(8, 4))
-            ax.bar(counts.index.astype(str), counts.values)
+            with _palette():
+                fig, ax = plt.subplots(figsize=(8, 4))
+                ax.bar(counts.index.astype(str), counts.values,
+                       color=OKABE_ITO[0])
             ax.set_title("Missing values per column")
             ax.set_ylabel("nulls")
             plt.xticks(rotation=45, ha="right")
@@ -660,7 +700,8 @@ class Data:
             "examples": bool(examples),
         }
 
-    def report(self, examples=True, to=None):
+    def report(self, examples: bool = True,
+               to: Optional[str] = None) -> "Data":
         """One-call profile of the whole dataset.
 
         Inspector: shows the profile and returns the SAME object.
@@ -738,7 +779,7 @@ class Data:
                     out.append(f"'{c}' is unique per row - looks like an ID")
         return out
 
-    def log(self):
+    def log(self) -> "Data":
         """Print the steps that produced this dataset."""
         if not self._steps:
             print("(no transforms applied yet)")
@@ -748,7 +789,7 @@ class Data:
                 print(f"  {i}. {s['display']}")
         return self
 
-    def steps(self):
+    def steps(self) -> List[str]:
         """Return the applied-step log as a list of strings.
 
         Escape hatch: returns plain values. For the structured form a recipe
@@ -757,7 +798,8 @@ class Data:
         return [s["display"] for s in self._steps]
 
     # ----------------------------------------------------------- AUTO
-    def clean(self, nulls="keep", dates=True, verbose=True):
+    def clean(self, nulls: str = "keep", dates: bool = True,
+              verbose: bool = True) -> "Data":
         """Auto-clean the dataset in one call.
 
         You say *clean it*; this works out the rest. It:
@@ -904,7 +946,8 @@ class Data:
         df.columns = cols
         return df
 
-    def fix_nulls(self, strategy="auto", subset=None):
+    def fix_nulls(self, strategy: str = "auto",
+                  subset: Optional[Union[str, List[str]]] = None) -> "Data":
         """Fill missing values without you picking a statistic per column.
 
         ``strategy="auto"`` (default) uses the median for numeric columns and
@@ -940,7 +983,8 @@ class Data:
                             call=("fix_nulls", (), {"strategy": strategy,
                                                     "subset": subset}))
 
-    def drop_outliers(self, cols=None, method="iqr", factor=1.5):
+    def drop_outliers(self, cols: Optional[Union[str, List[str]]] = None,
+                      method: str = "iqr", factor: float = 1.5) -> "Data":
         """Drop rows whose numeric values are statistical outliers.
 
         ``method="iqr"`` (default) removes points outside
@@ -974,45 +1018,45 @@ class Data:
                                                         "factor": factor}))
 
     # ----------------------------------------------------------- CLEAN
-    def dropna(self, subset=None):
+    def dropna(self, subset: Optional[Union[str, List[str]]] = None) -> "Data":
         return self._derive(self.df.dropna(subset=subset), step="dropna()",
                             call=("dropna", (), {"subset": subset}))
 
-    def fillna(self, value):
+    def fillna(self, value: Any) -> "Data":
         return self._derive(self.df.fillna(value), step="fillna()",
                             call=("fillna", (value,), {}))
 
-    def drop(self, cols):
+    def drop(self, cols: Union[str, List[str]]) -> "Data":
         cols = [cols] if isinstance(cols, str) else list(cols)
         return self._derive(self.df.drop(columns=cols),
                             step=f"drop({cols})",
                             call=("drop", (cols,), {}))
 
-    def keep(self, *cols):
+    def keep(self, *cols: str) -> "Data":
         cols = [c for c in cols if isinstance(c, str)]
         return self._derive(self.df[cols], step=f"keep({cols})",
                             call=("keep", cols, {}))
 
-    def rename(self, **kwargs):
+    def rename(self, **kwargs: str) -> "Data":
         return self._derive(self.df.rename(columns=kwargs), step="rename()",
                             call=("rename", (), kwargs))
 
-    def dedupe(self, subset=None):
+    def dedupe(self, subset: Optional[Union[str, List[str]]] = None) -> "Data":
         return self._derive(self.df.drop_duplicates(subset=subset),
                             step="dedupe()",
                             call=("dedupe", (), {"subset": subset}))
 
-    def astype(self, **kwargs):
+    def astype(self, **kwargs: Any) -> "Data":
         return self._derive(self.df.astype(kwargs), step="astype()",
                             call=("astype", (), kwargs))
 
-    def lower_cols(self):
+    def lower_cols(self) -> "Data":
         """Rename all columns to lowercase (common cleaning step)."""
         return self._derive(
             self.df.rename(columns={c: str(c).lower() for c in self.df.columns}),
             step="lower_cols()", call=("lower_cols", (), {}))
 
-    def to_float(self, *cols):
+    def to_float(self, *cols: str) -> "Data":
         """Convert string/object column(s) to float.
 
         Named columns: ``.to_float("price", "qty")``. With no arguments, every
@@ -1029,7 +1073,7 @@ class Data:
                             call=("to_float", tuple(cols), {}))
 
     # ----------------------------------------------------------- FILTER
-    def filter(self, expr):
+    def filter(self, expr: str) -> "Data":
         """Filter with a readable expression string.
 
         Supports: == != > < >= <= and or in not in
@@ -1061,7 +1105,7 @@ class Data:
             return self.df.query(expr, engine="python")
 
     # ----------------------------------------------------------- TRANSFORM
-    def mutate(self, **kwargs):
+    def mutate(self, **kwargs: Any) -> "Data":
         """Add/overwrite columns from expressions.
 
         mutate(bmi="weight / (height**2)", age1="age + 1")
@@ -1089,11 +1133,12 @@ class Data:
             ns = {str(c): df[c] for c in df.columns}
             return eval(expr, {"__builtins__": {}}, ns)  # noqa: S307
 
-    def select(self, *cols):
+    def select(self, *cols: str) -> "Data":
         return self._derive(self.df[list(cols)], step=f"select({list(cols)})",
                             call=("select", cols, {}))
 
-    def sort(self, by, ascending=True):
+    def sort(self, by: Union[str, List[str]],
+             ascending: bool = True) -> "Data":
         return self._derive(self.df.sort_values(by, ascending=ascending),
                             step=f"sort({by!r})",
                             call=("sort", (by,), {"ascending": ascending}))
@@ -1116,8 +1161,12 @@ class Data:
         """What to call a source in the report."""
         return os.path.basename(source) if isinstance(source, str) else f"source {i}"
 
-    def join(self, other, on=None, how="left", left_on=None, right_on=None,
-             suffix="_right", verbose=True):
+    def join(self, other: Union[str, "Data", pd.DataFrame],
+             on: Optional[Union[str, List[str]]] = None,
+             how: str = "left",
+             left_on: Optional[Union[str, List[str]]] = None,
+             right_on: Optional[Union[str, List[str]]] = None,
+             suffix: str = "_right", verbose: bool = True) -> "Data":
         """Join another table onto this one - and say what actually matched.
 
             d.join("regions.csv", on="city")
@@ -1239,7 +1288,8 @@ class Data:
         return self._derive(merged, step=f"join({how!r}, on={key_repr!r})")
 
     @_classorinstance
-    def concat(self, *sources, source_col=None, verbose=True):
+    def concat(self, *sources: Any, source_col: Optional[str] = None,
+               verbose: bool = True) -> "Data":
         """Stack tables on top of each other - files, globs, Data or frames.
 
             Data.concat("data/2024-*.csv")            # a folder of monthly files
@@ -1314,10 +1364,10 @@ class Data:
         return Data(df=out, steps=[step])
 
     # ----------------------------------------------------------- AGGREGATE
-    def groupby(self, *cols):
+    def groupby(self, *cols: str) -> "Data":
         return self._derive(self.df, group=list(cols))
 
-    def agg(self, how, col=None):
+    def agg(self, how: str, col: Optional[str] = None) -> "Data":
         if not self._group:
             raise RuntimeError("Call groupby() before agg()")
         grp = self.df.groupby(self._group)
@@ -1327,7 +1377,8 @@ class Data:
             out = grp.agg({col: how}).reset_index()
         return self._derive(out, step=f"groupby({self._group}).agg({how!r}, {col!r})")
 
-    def stat(self, how, col=None, by=None):
+    def stat(self, how: str, col: Optional[str] = None,
+             by: Optional[Union[str, List[str]]] = None) -> "Data":
         """One-call aggregate - no separate ``groupby()`` step.
 
             d.stat("mean", "price", by="city")
@@ -1351,52 +1402,58 @@ class Data:
         return self._derive(out, step=f"stat({how!r}, {col!r}, by={by!r})",
                             call=("stat", (how,), {"col": col, "by": by}))
 
-    def mean(self, col=None, by=None):
+    def mean(self, col: Optional[str] = None,
+                 by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.mean("price", by="city")`` - mean of a column, optionally grouped."""
         return self.stat("mean", col, by)
 
-    def sum(self, col=None, by=None):
+    def sum(self, col: Optional[str] = None,
+                by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.sum("revenue", by="city")``"""
         return self.stat("sum", col, by)
 
-    def count(self, col=None, by=None):
+    def count(self, col: Optional[str] = None,
+                  by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.count(by="city")`` - rows per group (no dummy column needed)."""
         return self.stat("count", col, by)
 
-    def median(self, col=None, by=None):
+    def median(self, col: Optional[str] = None,
+                   by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.median("price", by="city")``"""
         return self.stat("median", col, by)
 
-    def min(self, col=None, by=None):
+    def min(self, col: Optional[str] = None,
+                by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.min("price", by="city")``"""
         return self.stat("min", col, by)
 
-    def max(self, col=None, by=None):
+    def max(self, col: Optional[str] = None,
+                by: Optional[Union[str, List[str]]] = None) -> "Data":
         """``d.max("price", by="city")``"""
         return self.stat("max", col, by)
 
-    def top(self, n=5, by=None):
+    def top(self, n: int = 5, by: Optional[str] = None) -> "Data":
         """``d.top(5, "price")`` - the n highest rows by a column."""
         df = self.df if by is None else self.df.sort_values(by, ascending=False)
         return self._derive(df.head(n).reset_index(drop=True),
                             step=f"top({n}, {by!r})",
                             call=("top", (), {"n": n, "by": by}))
 
-    def bottom(self, n=5, by=None):
+    def bottom(self, n: int = 5, by: Optional[str] = None) -> "Data":
         """``d.bottom(5, "price")`` - the n lowest rows by a column."""
         df = self.df if by is None else self.df.sort_values(by, ascending=True)
         return self._derive(df.head(n).reset_index(drop=True),
                             step=f"bottom({n}, {by!r})",
                             call=("bottom", (), {"n": n, "by": by}))
 
-    def counts(self, col):
+    def counts(self, col: str) -> "Data":
         """``d.counts("city")`` - frequency table for one column."""
         out = self.df[col].value_counts(dropna=False).reset_index()
         out.columns = [col, "count"]
         return self._derive(out, step=f"counts({col!r})",
                             call=("counts", (col,), {}))
 
-    def summarize(self, **kwargs):
+    def summarize(self, **kwargs: str) -> "Data":
         """Quick named stats. summarize(mean_sal='mean(salary)', n='count()')"""
         out = {}
         for k, v in kwargs.items():
@@ -1412,21 +1469,30 @@ class Data:
         return self._derive(pd.DataFrame([out]), step=f"summarize({list(kwargs)})",
                             call=("summarize", (), kwargs))
 
-    def corr(self, method="pearson"):
+    def corr(self, method: str = "pearson") -> "Data":
         """Return the correlation matrix as a DataFrame."""
         return self._derive(self.df.corr(numeric_only=True, method=method),
                             step=f"corr({method!r})",
                             call=("corr", (), {"method": method}))
 
-    def plot_corr(self, title="Correlation matrix", cmap="coolwarm", show=None):
+    def plot_corr(self, title: str = "Correlation matrix", cmap: str = DIVERGING,
+                  show: Optional[bool] = None) -> "Data":
         """Heatmap of the numeric correlation matrix.
+
+        Plot method: draws and returns the SAME object.
 
         Renders inline in a notebook; ``show=True`` forces a window, and
         ``show=False`` holds the figure for ``.savefig()``.
+
+        The default ``cmap`` diverges about zero and is readable with the
+        common colour-vision deficiencies; pass any matplotlib colormap name
+        to override it. The scale is pinned to -1..+1 so the midpoint really
+        is "no correlation" - on an auto-scaled heatmap the neutral colour
+        lands wherever the data happens to sit, which reads as a lie.
         """
         fig, ax = plt.subplots(figsize=(8, 6))
         c = self.df.corr(numeric_only=True)
-        im = ax.imshow(c, cmap=cmap)
+        im = ax.imshow(c, cmap=cmap, vmin=-1, vmax=1)
         ax.set_xticks(range(len(c.columns)))
         ax.set_yticks(range(len(c.columns)))
         ax.set_xticklabels(c.columns, rotation=45, ha="right")
@@ -1437,7 +1503,9 @@ class Data:
         return self
 
     # ----------------------------------------------------------- VISUALIZE
-    def plot(self, kind="line", x=None, y=None, title=None, show=None, **kwargs):
+    def plot(self, kind: str = "line", x: Optional[str] = None,
+             y: Optional[str] = None, title: Optional[str] = None,
+             show: Optional[bool] = None, **kwargs: Any) -> "Data":
         """One-liner plot. kind: line|bar|hist|scatter|box|pie
 
         ``x`` and ``y`` are optional: on a two-column frame (what a grouped
@@ -1451,17 +1519,18 @@ class Data:
         """
         if x is None and y is None:
             x, y = self._infer_xy(kind)
-        fig, ax = plt.subplots(figsize=(8, 5))
-        if kind == "scatter":
-            ax.scatter(self.df[x], self.df[y])
-        elif kind == "hist":
-            ax.hist(self.df[x or y], **kwargs)
-        elif kind == "box":
-            self.df.boxplot(column=y, by=x, ax=ax)
-        elif kind == "pie":
-            self.df.plot(kind="pie", y=y, labels=self.df[x], ax=ax, **kwargs)
-        else:
-            self.df.plot(kind=kind, x=x, y=y, ax=ax, **kwargs)
+        with _palette(kwargs):
+            fig, ax = plt.subplots(figsize=(8, 5))
+            if kind == "scatter":
+                ax.scatter(self.df[x], self.df[y])
+            elif kind == "hist":
+                ax.hist(self.df[x or y], **kwargs)
+            elif kind == "box":
+                self.df.boxplot(column=y, by=x, ax=ax)
+            elif kind == "pie":
+                self.df.plot(kind="pie", y=y, labels=self.df[x], ax=ax, **kwargs)
+            else:
+                self.df.plot(kind=kind, x=x, y=y, ax=ax, **kwargs)
         if title:
             ax.set_title(title)
         self._fig = _render(fig, show)
@@ -1481,7 +1550,7 @@ class Data:
         # is no separate label column (a one-column frame plots against index).
         return (other[0] if other else None), num[0]
 
-    def show(self):
+    def show(self) -> "Data":
         """Display the current figure - or the data, if there is no figure.
 
         In a notebook the chart renders inline, in the same cell; from a script
@@ -1494,7 +1563,7 @@ class Data:
             print(self.df)
         return self
 
-    def savefig(self, path):
+    def savefig(self, path: str) -> "Data":
         """Write the current figure to a file. For when you want the PNG."""
         if self._fig is not None:
             self._fig.savefig(path, bbox_inches="tight")
@@ -1504,7 +1573,7 @@ class Data:
         return self
 
     # ----------------------------------------------------------- RECIPES
-    def save_recipe(self, path):
+    def save_recipe(self, path: str) -> "Data":
         """Write this pipeline to a JSON recipe another file can replay.
 
         Output method: writes a file and returns the SAME object.
@@ -1547,7 +1616,7 @@ class Data:
         print(f"saved recipe -> {path} ({len(steps)} steps)")
         return self
 
-    def apply_recipe(self, path, verbose=True):
+    def apply_recipe(self, path: str, verbose: bool = True) -> "Data":
         """Replay a saved recipe onto this dataset. Returns a NEW ``Data``.
 
         Transform: every step in the recipe runs in order, exactly as if you
@@ -1599,7 +1668,7 @@ class Data:
         return out
 
     # ----------------------------------------------------------- EXPORT
-    def to_csv(self, path):
+    def to_csv(self, path: str) -> "Data":
         """Write the frame to CSV, no index column.
 
         Output method: writes a file and returns the SAME object, so an export
@@ -1609,7 +1678,7 @@ class Data:
         print(f"saved -> {path}")
         return self
 
-    def to_excel(self, path, sheet_name="Sheet1"):
+    def to_excel(self, path: str, sheet_name: str = "Sheet1") -> "Data":
         """Write the frame to an Excel workbook, no index column.
 
         Output method: writes a file and returns the SAME object.
@@ -1622,7 +1691,8 @@ class Data:
         print(f"saved -> {path}")
         return self
 
-    def to_json(self, path, orient="records", indent=2):
+    def to_json(self, path: str, orient: str = "records",
+                indent: int = 2) -> "Data":
         """Write the frame to JSON.
 
         Output method: writes a file and returns the SAME object.
@@ -1635,7 +1705,7 @@ class Data:
         print(f"saved -> {path}")
         return self
 
-    def to_parquet(self, path, **kwargs):
+    def to_parquet(self, path: str, **kwargs: Any) -> "Data":
         """Write the frame to Parquet.
 
         Output method: writes a file and returns the SAME object.
@@ -1650,30 +1720,30 @@ class Data:
         print(f"saved -> {path}")
         return self
 
-    def to_df(self):
+    def to_df(self) -> pd.DataFrame:
         """Hand back the raw DataFrame for full pandas power."""
         return self.df
 
-    def to_fig(self):
+    def to_fig(self) -> Figure:
         """Hand back the matplotlib Figure for full matplotlib power."""
         if self._fig is None:
             raise RuntimeError("No figure yet. Call plot()/plot_corr() first.")
         return self._fig
 
-    def copy(self):
+    def copy(self) -> "Data":
         """An independent copy (rarely needed - transforms already copy)."""
         return self._derive(self.df.copy(), step="copy()", call=("copy", (), {}))
 
     # ----------------------------------------------------------- DUNDERS
-    def __str__(self):
+    def __str__(self) -> str:
         """`print(d)` shows the full dataset (not just the terse repr)."""
         return tabulate(self.df, headers="keys", tablefmt="github", showindex=False)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         cols = ", ".join(map(str, self.df.columns)) if len(self.df.columns) else "-"
         return f"dclean.Data({self.df.shape[0]}x{self.df.shape[1]}, cols=[{cols}])"
 
-    def _repr_html_(self, n=10):
+    def _repr_html_(self, n: int = 10) -> str:
         """Rich table for Jupyter - a display hook, so it changes nothing.
 
         A notebook renders this in place of ``__repr__``, so a bare ``d`` at
@@ -1689,5 +1759,5 @@ class Data:
                 f'margin-bottom:0.4em"><b>dclean.Data</b> &mdash; {header}</div>'
                 f'{self.df.head(n).to_html()}')
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.df)
