@@ -1,6 +1,7 @@
 """Core fluent DataFrame wrapper for dclean."""
 import functools
 import glob
+import importlib
 import os
 import re
 import sys
@@ -20,9 +21,33 @@ except ImportError:  # pragma: no cover - optional dependency
         showindex = kwargs.get("showindex", True)
         return df.to_string(index=bool(showindex))
 
-BOLD = "\033[1m"
-UNDER = "\033[4m"
-RESET = "\033[0m"
+# ----------------------------------------------------------------------- COLOR
+# Escape codes are for a terminal that can render them. Redirected into a file,
+# a pager or a CI log they are noise wrapped around every heading, so resolve
+# them once at import: FORCE_COLOR wins, then NO_COLOR (no-color.org), then the
+# honest question - is stdout actually a terminal?
+def _color_enabled(stream=None):
+    """True when it is safe to emit ANSI escapes on ``stream``."""
+    force = os.environ.get("FORCE_COLOR")
+    if force is not None:
+        return force != "0"
+    if os.environ.get("NO_COLOR"):
+        return False
+    stream = sys.stdout if stream is None else stream
+    try:
+        return bool(stream.isatty())
+    except Exception:  # pragma: no cover - a stream with no isatty()
+        return False
+
+
+def _resolve_colors(stream=None):
+    """``(BOLD, UNDER, RESET)`` for this environment - all empty when plain."""
+    if _color_enabled(stream):
+        return "\033[1m", "\033[4m", "\033[0m"
+    return "", "", ""
+
+
+BOLD, UNDER, RESET = _resolve_colors()
 
 # Values that mean "missing" in real-world exports but read as text.
 NA_TOKENS = {"", "na", "n/a", "n.a.", "nan", "null", "none", "-", "--", "?", "unknown"}
@@ -193,6 +218,25 @@ def _reject_dunder(expr):
             "filter()/mutate() strings are executed as code and must be "
             "written by you, never taken from user input.")
     return expr
+
+
+def _require(modules, what, install=None):
+    """Import the first available of ``modules``, or say what to pip install.
+
+    Optional dependencies are imported at the point of use, never at import
+    time, so ``pip install dcleaner`` stays small - and the error names the
+    exact command that fixes it instead of a bare ImportError.
+    """
+    names = [modules] if isinstance(modules, str) else list(modules)
+    for name in names:
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    raise ImportError(
+        "{} needs {}, which dclean does not install for you. "
+        "Run:  pip install {}".format(
+            what, " or ".join(repr(n) for n in names), install or names[0]))
 
 
 def _normalize_name(name):
@@ -1238,7 +1282,53 @@ class Data:
 
     # ----------------------------------------------------------- EXPORT
     def to_csv(self, path):
+        """Write the frame to CSV, no index column.
+
+        Output method: writes a file and returns the SAME object, so an export
+        can sit mid-chain.
+        """
         self.df.to_csv(path, index=False)
+        print(f"saved -> {path}")
+        return self
+
+    def to_excel(self, path, sheet_name="Sheet1"):
+        """Write the frame to an Excel workbook, no index column.
+
+        Output method: writes a file and returns the SAME object.
+
+        Needs ``openpyxl``, which dclean does not install for you
+        (``pip install openpyxl``); the error says so if it is missing.
+        """
+        _require("openpyxl", "to_excel()")
+        self.df.to_excel(path, sheet_name=sheet_name, index=False)
+        print(f"saved -> {path}")
+        return self
+
+    def to_json(self, path, orient="records", indent=2):
+        """Write the frame to JSON.
+
+        Output method: writes a file and returns the SAME object.
+
+        Defaults to ``orient="records"`` - a list of row objects, the shape
+        most tools expect - and ISO-8601 dates, so a column ``clean()`` parsed
+        into datetimes reads back as a date rather than epoch milliseconds.
+        """
+        self.df.to_json(path, orient=orient, indent=indent, date_format="iso")
+        print(f"saved -> {path}")
+        return self
+
+    def to_parquet(self, path, **kwargs):
+        """Write the frame to Parquet.
+
+        Output method: writes a file and returns the SAME object.
+
+        Needs ``pyarrow`` or ``fastparquet``, neither of which dclean installs
+        for you (``pip install pyarrow``); the error says so if both are
+        missing. Extra keyword arguments go straight to pandas
+        (``compression=``, ``engine=`` ...).
+        """
+        _require(("pyarrow", "fastparquet"), "to_parquet()", install="pyarrow")
+        self.df.to_parquet(path, index=False, **kwargs)
         print(f"saved -> {path}")
         return self
 
@@ -1264,6 +1354,22 @@ class Data:
     def __repr__(self):
         cols = ", ".join(map(str, self.df.columns)) if len(self.df.columns) else "-"
         return f"dclean.Data({self.df.shape[0]}x{self.df.shape[1]}, cols=[{cols}])"
+
+    def _repr_html_(self, n=10):
+        """Rich table for Jupyter - a display hook, so it changes nothing.
+
+        A notebook renders this in place of ``__repr__``, so a bare ``d`` at
+        the end of a cell shows the data instead of only its shape. ``repr()``
+        and ``str()`` are deliberately left alone: the terminal keeps the terse
+        one-liner and ``print(d)`` keeps the full table.
+        """
+        rows, cols = self.df.shape
+        header = f"{rows} rows &times; {cols} cols"
+        if rows > n:
+            header += f" &mdash; showing the first {n}"
+        return (f'<div style="font-family:monospace;font-size:0.9em;'
+                f'margin-bottom:0.4em"><b>dclean.Data</b> &mdash; {header}</div>'
+                f'{self.df.head(n).to_html()}')
 
     def __len__(self):
         return len(self.df)

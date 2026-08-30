@@ -670,3 +670,131 @@ def test_concat_flags_rows_duplicated_across_sources(capsys):
     out = Data.concat(Data.from_records(row), Data.from_records(row))
     assert "1 row duplicated across sources" in capsys.readouterr().out
     assert len(out.dedupe()) == 1
+
+
+# ----------------------------------------------------------------- CONSOLE OUTPUT
+class _FakeStream:
+    """A stdout stand-in whose tty-ness we control."""
+
+    def __init__(self, tty):
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+
+def test_ansi_codes_are_dropped_when_output_is_not_a_terminal(monkeypatch):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert core._resolve_colors(_FakeStream(False)) == ("", "", "")
+
+
+def test_ansi_codes_survive_on_a_real_terminal(monkeypatch):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    bold, under, reset = core._resolve_colors(_FakeStream(True))
+    assert bold and under and reset
+
+
+def test_no_color_beats_a_terminal(monkeypatch):
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert core._resolve_colors(_FakeStream(True)) == ("", "", "")
+
+
+def test_force_color_beats_a_pipe(monkeypatch):
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert core._resolve_colors(_FakeStream(False)) != ("", "", "")
+
+
+def test_force_color_zero_turns_colour_off(monkeypatch):
+    monkeypatch.setenv("FORCE_COLOR", "0")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    assert core._resolve_colors(_FakeStream(True)) == ("", "", "")
+
+
+def test_no_printer_hardcodes_an_escape_code(capsys, monkeypatch):
+    # With the codes resolved to "" (piped output), nothing may still emit an
+    # escape: every heading has to go through the module-level constants.
+    for name in ("BOLD", "UNDER", "RESET"):
+        monkeypatch.setattr(core, name, "")
+    Data(SAMPLE).report().nulls().describe().clean().log()
+    assert "\033[" not in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------- NOTEBOOK REPR
+def test_repr_html_shows_the_shape_and_the_rows():
+    html = Data(SAMPLE)._repr_html_()
+    assert "60 rows" in html and "4 cols" in html
+    assert "<table" in html
+
+
+def test_repr_html_says_when_it_truncated():
+    assert "showing the first 10" in Data(SAMPLE)._repr_html_()
+    short = Data(Data(SAMPLE).df.head(3))
+    assert "showing the first" not in short._repr_html_()
+
+
+def test_repr_html_leaves_repr_and_str_alone():
+    d = Data(SAMPLE)
+    assert repr(d).startswith("dclean.Data(60x4")
+    assert "<table" not in repr(d)
+    assert "<table" not in str(d)
+
+
+# ----------------------------------------------------------------- EXPORT PARITY
+def test_to_csv_returns_the_same_object(tmp_path):
+    d = Data(SAMPLE)
+    out = tmp_path / "out.csv"
+    assert d.to_csv(str(out)) is d
+    assert out.exists()
+
+
+def test_to_excel_round_trips(tmp_path):
+    pytest.importorskip("openpyxl")
+    d = Data(SAMPLE)
+    out = tmp_path / "out.xlsx"
+    assert d.to_excel(str(out)) is d
+    assert Data(str(out)).df.shape == d.df.shape
+
+
+def test_to_json_round_trips(tmp_path):
+    d = Data(SAMPLE)
+    out = tmp_path / "out.json"
+    assert d.to_json(str(out)) is d
+    assert Data(str(out)).df.shape == d.df.shape
+
+
+def test_to_json_writes_readable_dates(tmp_path):
+    d = Data.from_records([{"when": "2025-01-31", "n": 1}]).clean(verbose=False)
+    out = tmp_path / "dates.json"
+    d.to_json(str(out))
+    assert "2025-01-31" in out.read_text()
+
+
+def test_to_parquet_round_trips(tmp_path):
+    pytest.importorskip("pyarrow")
+    d = Data(SAMPLE)
+    out = tmp_path / "out.parquet"
+    assert d.to_parquet(str(out)) is d
+    assert Data(str(out)).df.shape == d.df.shape
+
+
+def test_missing_optional_dependency_names_the_pip_command(monkeypatch):
+    def boom(name):
+        raise ImportError(name)
+    monkeypatch.setattr(core.importlib, "import_module", boom)
+    with pytest.raises(ImportError) as e:
+        Data(SAMPLE).to_excel("nope.xlsx")
+    assert "pip install openpyxl" in str(e.value)
+    with pytest.raises(ImportError) as e:
+        Data(SAMPLE).to_parquet("nope.parquet")
+    assert "pip install pyarrow" in str(e.value)
+
+
+def test_exports_write_no_index_column(tmp_path):
+    d = Data(SAMPLE).filter("age > 18")
+    out = tmp_path / "out.csv"
+    d.to_csv(str(out))
+    assert Data(str(out)).df.columns.tolist() == d.df.columns.tolist()

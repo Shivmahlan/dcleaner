@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Export parity with loading.** `dclean` reads csv/csv.gz/xls/xlsx/json/parquet
+  but could only write CSV. `to_excel(path)`, `to_json(path)` and
+  `to_parquet(path)` join `to_csv(path)`, all with the same contract: write the
+  file, return the **same** object so an export can sit mid-chain. `openpyxl`
+  and `pyarrow` stay optional - they are imported inside the method, and the
+  error names the exact `pip install` when one is missing. `to_json` defaults to
+  `orient="records"` with ISO-8601 dates, so dates that `clean()` parsed read
+  back as dates rather than epoch milliseconds.
+- **`_repr_html_` on `Data`** - a bare `d` at the end of a notebook cell now
+  renders a real table (header line with the shape, plus the first 10 rows)
+  instead of the terse one-line repr. `repr()` and `str()` are unchanged, so
+  the terminal behaves exactly as before.
+- A **Run in Colab** badge on `examples/demo.ipynb`, so the tour runs with
+  nothing installed locally.
+
+### Fixed
+- **Bold/underline escape codes no longer leak into piped output.** They were
+  emitted unconditionally, so `dcleaner report x.csv > profile.txt`, a pager or
+  a CI log got `\033[1m` wrapped around every heading. The codes are now
+  resolved once at import and are empty unless stdout is a terminal;
+  `NO_COLOR` turns them off on a terminal and `FORCE_COLOR` turns them back on
+  through a pipe (`FORCE_COLOR=0` forces them off).
+
 ### Changed
 - **Plots now appear where you are working, instead of only in a saved PNG.**
   `dclean` no longer pins matplotlib to the `Agg` backend at import. In a

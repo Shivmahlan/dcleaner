@@ -16,6 +16,7 @@ drops you back into full pandas whenever you outgrow the wrapper.
 ![CI](https://github.com/Shivmahlan/dcleaner/actions/workflows/ci.yml/badge.svg)
 [![PyPI version](https://img.shields.io/pypi/v/dcleaner.svg)](https://pypi.org/project/dcleaner/)
 [![OpenSSF Best Practices](https://img.shields.io/badge/OpenSSF-baseline-blue)](https://www.bestpractices.dev/)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Shivmahlan/dcleaner/blob/main/examples/demo.ipynb)
 
 ---
 
@@ -66,7 +67,8 @@ dclean.clean("sample_sales.csv")      # fix it
 ```
 
 [`examples/demo.ipynb`](examples/demo.ipynb) walks the whole toolkit:
-profile → clean → aggregate → plot.
+profile → clean → aggregate → plot. Run it without installing anything:
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Shivmahlan/dcleaner/blob/main/examples/demo.ipynb)
 
 See the time saved side-by-side:
 [`examples/with_dcleaner.ipynb`](examples/with_dcleaner.ipynb) vs
@@ -282,7 +284,7 @@ The rule is simple:
 |---|---|
 | Transforms — `clean` `dropna` `filter` `mutate` `agg` `join` `concat` … | a **new** `Data` |
 | Inspectors — `head` `report` `nulls` `describe` `log` … | the **same** object (they change nothing) |
-| Plot / output — `plot` `savefig` `to_csv` `show` | the **same** object |
+| Plot / output — `plot` `savefig` `to_csv` `to_excel` `to_json` `to_parquet` `show` | the **same** object |
 | Escape hatches — `to_df` `to_fig` `steps` `len` `repr` | a plain value |
 
 > **Upgrading from 0.1.x?** Transforms used to modify in place, so
@@ -645,8 +647,30 @@ d.plot("scatter", x="age", y="salary", color="red", alpha=0.5)
 
 ## Exporting
 
+`dclean` writes back every format it reads:
+
 ```python
 d.to_csv("cleaned.csv")          # write the current frame, no index
+d.to_excel("cleaned.xlsx")       # needs: pip install openpyxl
+d.to_json("cleaned.json")        # records + ISO-8601 dates by default
+d.to_parquet("cleaned.parquet")  # needs: pip install pyarrow
+```
+
+All four return the **same** object, so an export can sit mid-chain:
+
+```python
+(Data("messy.csv")
+ .clean()
+ .to_csv("clean.csv")            # snapshot the cleaned data...
+ .filter("units > 5")            # ...and carry on
+ .to_parquet("big_orders.parquet"))
+```
+
+`openpyxl` and `pyarrow` are **not** installed with `dcleaner` — they are
+imported only when you call the method that needs one, and the error tells you
+the exact `pip install` if it is missing.
+
+```python
 raw = d.to_df()                  # get the raw pandas DataFrame back
 raw.describe()                   # now use any pandas method you like
 ```
@@ -809,7 +833,7 @@ d.to_fig()                           # the matplotlib Figure - full matplotlib
 | Aggregate | `.mean/.sum/.count/.median/.min/.max([col], [by])` `.top(n, by)` `.bottom(n, by)` `.counts(col)` `.stat(how, col, by)` | one call, no separate `groupby` step |
 | Aggregate (longhand) | `.groupby(*c).agg(how, col)` `.summarize(**stats)` `.corr([method])` | |
 | Plot | `.plot(kind, [x], [y], [title], [show])` `.plot_corr([title], [show])` | line/bar/hist/scatter/box/pie; `x`/`y` inferred on a 2-column frame; `show=` overrides where it renders |
-| Output | `.show()` `.savefig(path)` `.to_csv(path)` `.to_df()` `.to_fig()` | `.show()`/`.plot()` render inline in notebooks, in a window from a script |
+| Output | `.show()` `.savefig(path)` `.to_csv(path)` `.to_excel(path)` `.to_json(path)` `.to_parquet(path)` `.to_df()` `.to_fig()` | `.show()`/`.plot()` render inline in notebooks, in a window from a script; `to_excel`/`to_parquet` need `openpyxl`/`pyarrow` |
 | Provenance | `.log()` `.steps()` | what the pipeline actually did |
 
 Transform methods return a **new** `Data` (the original is untouched);
