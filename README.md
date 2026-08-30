@@ -59,8 +59,9 @@ Requirements: Python ≥ 3.8, plus `pandas`, `matplotlib`, and `numpy`
 
 ## Try it
 
-A messy sample dataset ships inside the package, so every example below runs
-as-is — no downloads, no setup:
+A messy sample dataset ships inside the package — plus a clean city lookup
+table to join it against — so every example below runs as-is, no downloads, no
+setup:
 
 ```python
 import dclean
@@ -258,7 +259,7 @@ Every example here runs immediately after `pip install dcleaner` — no
 downloads:
 
 ```python
-Data.samples()                  # -> ['sample_sales.csv']
+Data.samples()                  # -> ['sample_cities.csv', 'sample_sales.csv']
 dclean.report("sample_sales.csv")
 ```
 
@@ -570,23 +571,48 @@ tables share. `how` is `left` (default), `inner`, `right` or `outer`.
 
 **The report is the feature.** A join where one side says `"SF "` and the other
 says `"SF"` matches nothing, tells you nothing, and quietly poisons every number
-downstream. So `join()` counts what matched before it merges:
+downstream. So `join()` counts what matched *before* it merges. A city lookup
+table ships with the package alongside the sales data, so this runs as-is:
+
+```python
+(Data("sample_sales.csv")
+    .lower_cols()                        # fix the column names, skip clean()
+    .join("sample_cities.csv", on="city"))
+```
 
 ```
 JOIN
   + left join on 'city'
-  + 2 of 4 left rows matched, 2 of 5 right rows used
-  ! 2 rows on the left matched nothing (kept, with nulls): 'SF ', 'chicago'
+  + 38 of 64 left rows matched, 4 of 5 right rows used
+  ! 26 rows on the left matched nothing (kept, with nulls): '  Chicago', '  New York', 'los angeles'
   ! 2 of those keys match after case/whitespace folding - .clean() both sides before joining
-  ! 3 rows on the right matched nothing (dropped)
-  + right columns kept under a suffix: notes_right
--> 4x3 to 4x5
+  ! 1 row on the right matched nothing (dropped)
+  + right columns kept under a suffix: region_right
+-> 64x9 to 64x11
 ```
 
-Every line there is a bug people actually ship: keys that miss, keys that would
-match after a `.clean()`, rows silently dropped by an `inner` join, and — the
-one that inflates totals without changing the row count you were watching — a
-non-unique key on the right:
+Twenty-six rows would have gone missing without a word. Clean the keys first and
+they land:
+
+```python
+(Data("sample_sales.csv")
+    .clean(verbose=False)
+    .join("sample_cities.csv", on="city"))
+```
+
+```
+  + 50 of 60 left rows matched, 4 of 5 right rows used
+  ! 10 rows on the left matched nothing (kept, with nulls): 'los angeles'
+```
+
+The ten still missing are a real data problem rather than a formatting one —
+`los angeles` and `LA` are the same city, and no amount of trimming will merge
+them. That is the difference the report buys you: you now know *which* of the two
+you are looking at.
+
+The other lines are bugs people ship every week: rows silently dropped by an
+`inner` join, null keys, and — the one that inflates a total without touching
+the row count you were watching — a non-unique key on the right:
 
 ```
   ! the right key is not unique - the join added 340 rows

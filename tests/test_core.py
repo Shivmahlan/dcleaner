@@ -672,6 +672,24 @@ def test_concat_flags_rows_duplicated_across_sources(capsys):
     assert len(out.dedupe()) == 1
 
 
+def test_concat_refuses_to_overwrite_an_existing_source_col():
+    with pytest.raises(ValueError, match="already a column"):
+        Data.concat(Data.from_records([{"v": 1, "file": "keep me"}]),
+                    Data.from_records([{"v": 2}]), source_col="file")
+
+
+def test_the_bundled_lookup_joins_to_the_bundled_sales(capsys):
+    # the README's join example must keep working after a plain `pip install`
+    assert "sample_cities.csv" in Data.samples()
+    out = (Data("sample_sales.csv").clean(verbose=False)
+           .join("sample_cities.csv", on="city"))
+    assert "population" in out.to_df().columns
+    assert "region_right" in out.to_df().columns      # the lookup's own region
+    printed = capsys.readouterr().out
+    assert "50 of 60 left rows matched" in printed
+    assert "'los angeles'" in printed                 # a real, unfixable-by-trim miss
+
+
 # ----------------------------------------------------------------- CONSOLE OUTPUT
 class _FakeStream:
     """A stdout stand-in whose tty-ness we control."""
