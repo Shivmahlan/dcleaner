@@ -1,10 +1,12 @@
 import os
+import subprocess
+import sys
 import matplotlib
 matplotlib.use("Agg")
 import pandas as pd
 import pytest
 
-from dclean import Data
+from dclean import Data, core
 
 HERE = os.path.dirname(__file__)
 SAMPLE = os.path.join(HERE, "data", "sample.csv")
@@ -435,3 +437,236 @@ def test_expression_guard_blocks_dunder_access():
     # ordinary expressions are untouched
     assert len(d.filter("n > 1")) == 1
     assert d.mutate(z="n * 2").to_df()["z"].tolist() == [2, 4]
+
+
+# ----------------------------------------------------------------- DISPLAY
+
+@pytest.mark.parametrize("backend,mode", [
+    ("module://matplotlib_inline.backend_inline", "notebook"),
+    ("nbAgg", "notebook"),
+    ("module://ipympl.backend_nbagg", "notebook"),
+    ("Agg", "headless"),
+    ("svg", "headless"),
+    ("TkAgg", "gui"),
+    ("MacOSX", "gui"),
+    ("QtAgg", "gui"),
+])
+def test_display_mode_classifies_backends(monkeypatch, backend, mode):
+    monkeypatch.setattr(core.matplotlib, "get_backend", lambda: backend)
+    assert core._display_mode() == mode
+
+
+def test_import_never_pins_the_backend():
+    # The whole point: dclean must not force Agg, or plots can only ever be
+    # looked at as a saved PNG. An explicit choice must survive the import.
+    env = {k: v for k, v in os.environ.items() if k != "MPLBACKEND"}
+    code = ("import matplotlib; matplotlib.use('svg');"
+            "import dclean; print(matplotlib.get_backend())")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                         text=True, env=env, cwd=os.path.dirname(HERE))
+    assert out.stdout.strip().lower() == "svg", out.stderr
+
+
+def test_plot_renders_inline_and_leaves_no_duplicate_figure():
+    pytest.importorskip("matplotlib_inline")
+    env = {k: v for k, v in os.environ.items() if k != "MPLBACKEND"}
+    code = ("import matplotlib;"
+            "matplotlib.use('module://matplotlib_inline.backend_inline');"
+            "import matplotlib.pyplot as plt; from dclean import Data;"
+            "d = Data.from_records([{'v': 1}, {'v': 2}]).plot('bar');"
+            "print('OPEN', plt.get_fignums());"
+            "print('FIG', type(d.to_fig()).__name__)")
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                         text=True, env=env, cwd=os.path.dirname(HERE))
+    # displayed once, then closed - otherwise the inline backend flushes it
+    # again at the end of the cell and the notebook shows the chart twice
+    assert "OPEN []" in out.stdout, out.stderr
+    assert "FIG Figure" in out.stdout, out.stderr
+
+
+def test_show_without_a_display_explains_itself(capsys):
+    # tests run under Agg; show() used to be a silent no-op here
+    Data.from_records([{"v": 1}, {"v": 2}]).plot("bar").show()
+    out = capsys.readouterr().out
+    assert "no display available" in out and "savefig" in out
+
+
+def test_show_without_a_figure_prints_the_data(capsys):
+    Data.from_records([{"v": 1}, {"v": 2}]).show()
+    assert "v" in capsys.readouterr().out
+
+
+def test_plot_show_false_still_saves(tmp_path):
+    out = tmp_path / "p.png"
+    Data.from_records([{"v": 1}, {"v": 2}]).plot("bar", show=False).savefig(str(out))
+    assert out.exists() and os.path.getsize(out) > 0
+
+
+def test_to_fig_requires_a_plot():
+    with pytest.raises(RuntimeError, match="No figure"):
+        Data.from_records([{"v": 1}]).to_fig()
+
+
+# ----------------------------------------------------------------- COMBINE
+
+def _regions():
+    return Data.from_records([
+        {"city": "NY", "region": "east"},
+        {"city": "LA", "region": "west"},
+        {"city": "SF", "region": "west"},
+    ])
+
+
+def _sales():
+    return Data.from_records([
+        {"city": "NY", "units": 1},
+        {"city": "LA", "units": 2},
+        {"city": "SF ", "units": 3},     # padded - looks matched, is not
+        {"city": "boston", "units": 4},  # genuinely absent on the right
+    ])
+
+
+def test_join_keeps_every_left_row_and_counts_the_matches(capsys):
+    out = _sales().join(_regions(), on="city")
+    assert len(out) == 4                          # left join keeps them all
+    assert out.to_df()["region"].isna().sum() == 2
+    printed = capsys.readouterr().out
+    assert "2 of 4 left rows matched" in printed
+    assert "2 rows on the left matched nothing" in printed
+    assert "'SF '" in printed and "'boston'" in printed
+
+
+def test_join_flags_keys_that_only_need_cleaning(capsys):
+    # the quiet killer: 'SF ' vs 'SF' matches nothing and nobody notices
+    _sales().join(_regions(), on="city")
+    printed = capsys.readouterr().out
+    assert "1 of those keys match after case/whitespace folding" in printed
+
+
+def test_join_inner_drops_the_misses(capsys):
+    out = _sales().join(_regions(), on="city", how="inner")
+    assert len(out) == 2
+    assert "(dropped)" in capsys.readouterr().out
+
+
+def test_join_warns_when_the_right_key_multiplies_rows(capsys):
+    reps = Data.from_records([{"city": "NY", "rep": "ann"},
+                              {"city": "NY", "rep": "bob"}])
+    out = _sales().join(reps, on="city")
+    assert len(out) == 5                          # 4 left rows, one duplicated
+    assert "the right key is not unique - the join added 1 row" in capsys.readouterr().out
+
+
+def test_join_warns_about_null_keys(capsys):
+    left = Data.from_records([{"city": "NY", "units": 1}, {"city": None, "units": 2}])
+    left.join(_regions(), on="city")
+    assert "1 row on the left have a null key" in capsys.readouterr().out
+
+
+def test_join_infers_the_shared_column(capsys):
+    out = _sales().join(_regions())
+    assert "region" in out.to_df().columns
+    assert "(inferred - the shared column)" in capsys.readouterr().out
+
+
+def test_join_without_a_shared_column_says_what_to_do():
+    with pytest.raises(ValueError, match="no column in common"):
+        _sales().join(Data.from_records([{"zone": "a"}]))
+
+
+def test_join_rejects_keys_that_can_never_match():
+    numeric_key = Data.from_records([{"city": 1, "region": "east"}])
+    with pytest.raises(ValueError, match="text on the left but .* is number"):
+        _sales().join(numeric_key, on="city")
+
+
+def test_join_accepts_differently_named_keys():
+    right = Data.from_records([{"name": "NY", "region": "east"}])
+    out = _sales().join(right, left_on="city", right_on="name", verbose=False)
+    assert out.to_df()["region"].tolist()[0] == "east"
+    with pytest.raises(ValueError, match="must be given together"):
+        _sales().join(right, left_on="city")
+
+
+def test_join_suffixes_overlapping_columns(capsys):
+    right = Data.from_records([{"city": "NY", "units": 99}])
+    out = _sales().join(right, on="city")
+    assert out.to_df()["units"].tolist()[0] == 1          # left column wins its name
+    assert out.to_df()["units_right"].tolist()[0] == 99
+    assert "units_right" in capsys.readouterr().out
+
+
+def test_join_reads_a_path_or_a_dataframe(tmp_path):
+    csv = tmp_path / "regions.csv"
+    _regions().to_csv(str(csv))
+    from_path = _sales().join(str(csv), on="city", verbose=False)
+    from_frame = _sales().join(_regions().to_df(), on="city", verbose=False)
+    pd.testing.assert_frame_equal(from_path.to_df(), from_frame.to_df())
+    with pytest.raises(TypeError, match="expected a Data"):
+        _sales().join(42)
+
+
+def test_join_rejects_an_unknown_how():
+    with pytest.raises(ValueError, match="how must be"):
+        _sales().join(_regions(), on="city", how="sideways")
+
+
+def test_join_never_touches_either_side(capsys):
+    left, right = _sales(), _regions()
+    before_l, before_r = left.to_df().copy(), right.to_df().copy()
+    left.join(right, on="city")
+    pd.testing.assert_frame_equal(left.to_df(), before_l)
+    pd.testing.assert_frame_equal(right.to_df(), before_r)
+
+
+def test_join_is_silent_and_logged(capsys):
+    out = _sales().join(_regions(), on="city", verbose=False)
+    assert capsys.readouterr().out == ""
+    assert out.steps() == ["join('left', on='city')"]
+
+
+def test_concat_stacks_files_from_a_glob(tmp_path, capsys):
+    for name, city in [("m_01.csv", "NY"), ("m_02.csv", "LA")]:
+        Data.from_records([{"city": city, "units": 1}]).to_csv(str(tmp_path / name))
+    out = Data.concat(str(tmp_path / "m_*.csv"), source_col="file")
+    assert len(out) == 2
+    assert out.to_df()["file"].tolist() == ["m_01.csv", "m_02.csv"]
+    assert "2 sources" in capsys.readouterr().out
+    with pytest.raises(ValueError, match="no files match"):
+        Data.concat(str(tmp_path / "nothing_*.csv"))
+
+
+def test_concat_on_an_instance_keeps_its_own_rows(capsys):
+    a = Data.from_records([{"v": 1}])
+    out = a.concat(Data.from_records([{"v": 2}]))
+    assert out.to_df()["v"].tolist() == [1, 2]     # not just [2]
+    assert "this data" in capsys.readouterr().out
+    assert len(a) == 1                             # and `a` itself is untouched
+
+
+def test_concat_takes_a_list_and_records_the_step():
+    out = Data.concat([Data.from_records([{"v": 1}]), Data.from_records([{"v": 2}])],
+                      verbose=False)
+    assert len(out) == 2
+    assert out.steps() == ["concat(2 sources)"]
+
+
+def test_concat_reports_columns_that_do_not_line_up(capsys):
+    Data.concat(Data.from_records([{"a": 1, "notes": "x"}]),
+                Data.from_records([{"a": 2, "extra": 9}]))
+    printed = capsys.readouterr().out
+    assert "'notes' is missing from source 1" in printed
+    assert "'extra' is missing from source 0" in printed
+
+
+def test_concat_reports_a_type_that_changes_between_sources(capsys):
+    Data.concat(Data.from_records([{"price": 1.5}]),
+                Data.from_records([{"price": "$3.50"}]))
+    assert "'price' is number / text in different sources" in capsys.readouterr().out
+
+
+def test_concat_flags_rows_duplicated_across_sources(capsys):
+    row = [{"v": 1}]
+    out = Data.concat(Data.from_records(row), Data.from_records(row))
+    assert "1 row duplicated across sources" in capsys.readouterr().out
+    assert len(out.dedupe()) == 1

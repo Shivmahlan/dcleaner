@@ -4,6 +4,44 @@ All notable changes to `dcleaner` are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- **Plots now appear where you are working, instead of only in a saved PNG.**
+  `dclean` no longer pins matplotlib to the `Agg` backend at import. In a
+  Jupyter/IPython notebook a chart renders **inline** the moment you call
+  `.plot()` / `.plot_corr()` / `.nulls(plot=True)`; from a script or REPL,
+  `.show()` opens it in a window (it was silently a no-op before, which left
+  `savefig()` + opening the file as the only way to look at a chart). With no
+  display available, matplotlib still falls back to a file-only backend, so
+  `savefig()` keeps working in scripts, CI and servers - and `.show()` now says
+  why it cannot show anything rather than doing nothing.
+  An explicitly chosen backend (`matplotlib.use(...)` before importing
+  `dclean`, or `MPLBACKEND`) is always respected.
+
+### Added
+- **`join()` - combine two tables, and find out what actually matched.**
+  `d.join("regions.csv", on="city")` (also `how="inner"/"right"/"outer"`,
+  multi-column keys, and `left_on=`/`right_on=` when the two sides spell the key
+  differently). `other` can be a `Data`, a DataFrame or a path; `on` defaults to
+  the shared columns. The report is the feature: how many rows on each side
+  matched, the keys that did not (with a sample), how many of those *would*
+  match after case/whitespace folding, rows dropped by the `how`, null keys, and
+  a warning when a non-unique right key multiplied your rows. Keys whose types
+  can never match are refused up front instead of returning an empty frame.
+  `verbose=False` skips the report and the counting work with it.
+- **`concat()` - stack tables on top of each other.** `Data.concat("data/*.csv")`
+  (globs, paths, `Data`s and DataFrames, or a list of them), or `d.concat(other)`
+  on an existing `Data`. `source_col="file"` records which source each row came
+  from. Reports the column that is missing from one source and the column whose
+  type changes between sources - the two things that quietly ruin a stacked
+  dataset.
+- `show=` on `plot()`, `plot_corr()` and `nulls(plot=True)`: `None` (default)
+  picks the sensible thing for where you are running, `True` displays it now,
+  `False` builds the figure without displaying it.
+- `to_fig()` - hands back the matplotlib `Figure`, the plotting counterpart of
+  `to_df()`, for anything `dclean` doesn't wrap.
+
 ## [0.2.0] - 2026-08-29
 
 ### Changed - BREAKING

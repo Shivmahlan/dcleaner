@@ -1,9 +1,11 @@
 """Core fluent DataFrame wrapper for dclean."""
+import functools
+import glob
 import os
 import re
+import sys
 import pandas as pd
 import matplotlib
-matplotlib.use("Agg")  # headless-safe; plots still save/show in notebooks
 import matplotlib.pyplot as plt
 
 # Show every column (no "..." truncation) on any raw pandas print.
@@ -29,6 +31,142 @@ _DATEISH = re.compile(
     r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}"      # 2025-01-31 / 2025/1/31
     r"|^\s*\d{1,2}[-/]\d{1,2}[-/]\d{2,4}"   # 31-01-2025 / 1/31/25
 )
+
+
+# --------------------------------------------------------------------- DISPLAY
+# A plot should appear where you are working - inline in a notebook, in a window
+# from a script or REPL - not as a PNG you have to go and open. dclean therefore
+# pins no backend: it only fills in the one matplotlib cannot guess for itself
+# (a Jupyter kernel) and leaves matplotlib's own detection - which already falls
+# back to Agg when there is no display - alone everywhere else.
+_NON_INTERACTIVE_BACKENDS = {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}
+_NOTEBOOK_BACKENDS = ("inline", "ipympl", "nbagg", "widget")
+
+
+def _in_jupyter():
+    """True inside a Jupyter/IPython kernel (not a plain terminal IPython)."""
+    try:
+        shell = sys.modules["IPython"].get_ipython()
+    except (KeyError, AttributeError):  # pragma: no cover - IPython not installed
+        return False
+    return shell is not None and hasattr(shell, "kernel")
+
+
+def _backend_unset():
+    """True when nobody has told matplotlib which backend to use."""
+    try:
+        from matplotlib import rcsetup
+        return (dict.__getitem__(matplotlib.rcParams, "backend")
+                is rcsetup._auto_backend_sentinel)
+    except Exception:  # pragma: no cover - private API moved; assume "chosen"
+        return False
+
+
+def _autoselect_backend():
+    """Pick the inline backend in notebooks; never override an explicit choice."""
+    if os.environ.get("MPLBACKEND") or not _backend_unset():
+        return  # the user (or a test) asked for a specific backend - respect it
+    if _in_jupyter():
+        try:
+            matplotlib.use("module://matplotlib_inline.backend_inline")
+        except Exception:  # pragma: no cover - matplotlib_inline not installed
+            pass
+
+
+_autoselect_backend()
+
+
+def _display_mode():
+    """Where a figure can be shown: ``notebook``, ``gui`` or ``headless``."""
+    backend = matplotlib.get_backend().lower()
+    if any(k in backend for k in _NOTEBOOK_BACKENDS):
+        return "notebook"
+    if backend in _NON_INTERACTIVE_BACKENDS:
+        return "headless"
+    return "gui"
+
+
+def _render(fig, show):
+    """Put ``fig`` in front of the user, or hold it for later.
+
+    ``show=None`` means auto: render inline in a notebook, where it is free and
+    is exactly what you expect; stay quiet in a script, where popping a blocking
+    window mid-pipeline would hijack the run - call ``.show()`` there.
+    """
+    mode = _display_mode()
+    if show is None:
+        show = mode == "notebook"
+    if show and mode == "notebook":
+        try:
+            from IPython.display import display
+            display(fig)
+            plt.close(fig)  # shown already; stops the duplicate at end of cell
+        except ImportError:  # pragma: no cover - inline backend without IPython
+            plt.show()
+    elif show and mode == "gui":
+        plt.show()
+    elif show:
+        print("no display available (matplotlib backend "
+              f"'{matplotlib.get_backend()}') - save the plot instead: "
+              ".savefig('plot.png')")
+    elif mode == "notebook":
+        plt.close(fig)  # show=False means show=False, even in a notebook
+    return fig
+
+
+def _listify(x):
+    """One column name or several -> a list of names."""
+    return list(x) if isinstance(x, (list, tuple)) else [x]
+
+
+def _dtype_kind(s):
+    """Coarse type of a Series: what has to agree for a join key to work."""
+    if pd.api.types.is_numeric_dtype(s) and not pd.api.types.is_bool_dtype(s):
+        return "number"
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return "date"
+    if pd.api.types.is_bool_dtype(s):
+        return "bool"
+    return "text"
+
+
+def _key_tuples(df, keys):
+    """Rows of ``keys`` as hashable tuples - for set membership on any key."""
+    return [tuple(row) for row in df[keys].astype(object).to_numpy()]
+
+
+def _folded_key_tuples(df, keys):
+    """Key tuples with case and padding removed - for near-miss diagnosis."""
+    folded = df[keys].astype(str).apply(lambda c: c.str.strip().str.lower())
+    return [tuple(row) for row in folded.to_numpy()]
+
+
+def _rows(n):
+    """`1 row` / `3 rows` - reports that read like English."""
+    return f"{n} row" + ("" if n == 1 else "s")
+
+
+def _fmt_keys(values, limit=3):
+    """`'SF ', 'chicago' (+2 more)` - a readable sample of key values."""
+    shown = [repr(v[0]) if len(v) == 1 else repr(tuple(v)) for v in values[:limit]]
+    more = len(values) - len(shown)
+    return ", ".join(shown) + (f" (+{more} more)" if more > 0 else "")
+
+
+class _classorinstance:
+    """A method that works both as ``Data.concat(...)`` and ``d.concat(...)``.
+
+    A plain ``classmethod`` called on an instance silently discards that
+    instance, so ``d.concat(other)`` would drop ``d``'s own rows - the wrong
+    answer, quietly. This passes the instance through (``None`` off the class).
+    """
+
+    def __init__(self, func):
+        self.func = func
+        functools.update_wrapper(self, func)
+
+    def __get__(self, obj, objtype=None):
+        return functools.partial(self.func, obj)
 
 
 def _clean_numeric_strings(s):
@@ -81,7 +219,7 @@ class Data:
          .filter("age > 18")
          .groupby("city").agg("mean", "salary")
          .plot("bar", x="city", y="salary")
-         .savefig("out.png"))
+         .show())
 
     Inspect methods (``head``, ``nulls``, ``report`` ...) print and return the
     same object, since they change nothing. Drop back to raw pandas anytime
@@ -247,12 +385,13 @@ class Data:
             print(f"{BOLD}-> mean | {callout}{RESET}\n")
         return self
 
-    def nulls(self, plot=False):
+    def nulls(self, plot=False, show=None):
         """Show missing-value counts per column (and the total).
 
         Returns the same object so it can sit in a chain right before
-        ``.dropna()``. Set ``plot=True`` to also render a bar chart of the null
-        counts (finish with ``.savefig()`` / ``.show()``).
+        ``.dropna()``. Set ``plot=True`` to also chart the null counts - it
+        renders inline in a notebook; from a script add ``.show()`` for a
+        window or ``.savefig()`` for a file.
         """
         counts = self.df.isna().sum()
         total = int(counts.sum())
@@ -269,7 +408,7 @@ class Data:
             ax.set_title("Missing values per column")
             ax.set_ylabel("nulls")
             plt.xticks(rotation=45, ha="right")
-            self._fig = fig
+            self._fig = _render(fig, show)
         return self
 
     def report(self, examples=True):
@@ -698,6 +837,221 @@ class Data:
         return self._derive(self.df.sort_values(by, ascending=ascending),
                             step=f"sort({by!r})")
 
+    # ----------------------------------------------------------- COMBINE
+    @staticmethod
+    def _as_frame(source):
+        """``Data`` / ``DataFrame`` / file path -> a DataFrame."""
+        if isinstance(source, Data):
+            return source.df
+        if isinstance(source, pd.DataFrame):
+            return source
+        if isinstance(source, str):
+            return Data(source).df
+        raise TypeError("expected a Data, a DataFrame or a file path, "
+                        f"got {type(source).__name__}")
+
+    @staticmethod
+    def _label(source, i):
+        """What to call a source in the report."""
+        return os.path.basename(source) if isinstance(source, str) else f"source {i}"
+
+    def join(self, other, on=None, how="left", left_on=None, right_on=None,
+             suffix="_right", verbose=True):
+        """Join another table onto this one - and say what actually matched.
+
+            d.join("regions.csv", on="city")
+            d.join(other, on=["city", "year"], how="inner")
+            d.join(other, left_on="city_id", right_on="id")
+
+        ``other`` is a ``Data``, a DataFrame, or a path. ``on`` defaults to the
+        columns the two tables share. ``how`` is ``left`` (default), ``inner``,
+        ``right`` or ``outer``.
+
+        The report is the point. A join that silently matches nothing - because
+        one side says ``"SF "`` and the other ``"SF"`` - is the classic way to
+        get quietly wrong numbers, so this counts the rows that matched, shows
+        the keys that did not, tells you when they would match after
+        ``.clean()``, and warns when a non-unique key multiplied your rows.
+        Set ``verbose=False`` to skip it. Returns a NEW ``Data``.
+        """
+        if how not in ("left", "right", "inner", "outer"):
+            raise ValueError("how must be 'left', 'right', 'inner' or 'outer'")
+        right = self._as_frame(other)
+        left = self.df
+
+        # ---- work out the key
+        inferred = False
+        if on is not None:
+            lk = rk = _listify(on)
+        elif left_on is not None or right_on is not None:
+            if left_on is None or right_on is None:
+                raise ValueError("left_on and right_on must be given together "
+                                 "(or use on= for a shared column name)")
+            lk, rk = _listify(left_on), _listify(right_on)
+            if len(lk) != len(rk):
+                raise ValueError("left_on and right_on must name the same "
+                                 "number of columns")
+        else:
+            lk = rk = [c for c in left.columns if c in right.columns]
+            inferred = True
+            if not lk:
+                raise ValueError(
+                    "join() found no column in common - name the key with "
+                    "on='id', or left_on=/right_on= when the two sides spell "
+                    "it differently")
+        for k in lk:
+            if k not in left.columns:
+                raise KeyError(f"join key {k!r} is not a column on the left "
+                               f"(have: {', '.join(map(str, left.columns))})")
+        for k in rk:
+            if k not in right.columns:
+                raise KeyError(f"join key {k!r} is not a column on the right "
+                               f"(have: {', '.join(map(str, right.columns))})")
+
+        # ---- types have to agree, and pandas' own error does not say how to fix it
+        for a, b in zip(lk, rk):
+            ka, kb = _dtype_kind(left[a]), _dtype_kind(right[b])
+            if ka != kb:
+                raise ValueError(
+                    f"join key {a!r} is {ka} on the left but {b!r} is {kb} on "
+                    f"the right - they can never match. Make them agree first, "
+                    f"e.g. .to_float({a!r}) or .astype({a}='str')")
+
+        # ---- who matched whom, measured before the merge so `how` can't hide
+        # it. Only when someone is going to read it: on a big frame this walks
+        # both key columns, and verbose=False should stay as cheap as pd.merge.
+        if verbose:
+            left_keys, right_keys = _key_tuples(left, lk), _key_tuples(right, rk)
+            right_set, left_set = set(right_keys), set(left_keys)
+            l_hit = [k in right_set for k in left_keys]
+            r_hit = [k in left_set for k in right_keys]
+            n_l_miss, n_r_miss = l_hit.count(False), r_hit.count(False)
+            missed = sorted({k for k, hit in zip(left_keys, l_hit) if not hit},
+                            key=lambda t: tuple(map(str, t)))
+
+            # ---- would those misses match if the key were cleaned up?
+            near = 0
+            if missed and any(_dtype_kind(left[k]) == "text" for k in lk):
+                folded_right = set(_folded_key_tuples(right, rk))
+                miss_rows = left.loc[[not h for h in l_hit], lk]
+                near = len({t for t in _folded_key_tuples(miss_rows, lk)
+                            if t in folded_right})
+
+        overlap = [c for c in right.columns
+                   if c in left.columns and c not in (rk if lk == rk else [])]
+        merged = (pd.merge(left, right, on=lk, how=how, suffixes=("", suffix))
+                  if lk == rk else
+                  pd.merge(left, right, left_on=lk, right_on=rk, how=how,
+                           suffixes=("", suffix)))
+        merged = merged.reset_index(drop=True)
+
+        if verbose:
+            key_txt = lk[0] if len(lk) == 1 else str(lk)
+            print(f"\n{BOLD}{UNDER}JOIN{RESET}")
+            print(f"  + {how} join on {key_txt!r}"
+                  f"{' (inferred - the shared column)' if inferred else ''}")
+            print(f"  + {l_hit.count(True)} of {len(left)} left rows matched, "
+                  f"{r_hit.count(True)} of {len(right)} right rows used")
+            if n_l_miss:
+                fate = "dropped" if how in ("inner", "right") else "kept, with nulls"
+                print(f"  ! {_rows(n_l_miss)} on the left matched nothing "
+                      f"({fate}): {_fmt_keys(missed)}")
+            if near:
+                print(f"  ! {near} of those keys match after case/whitespace "
+                      f"folding - .clean() both sides before joining")
+            if n_r_miss:
+                fate = "dropped" if how in ("inner", "left") else "kept, with nulls"
+                print(f"  ! {_rows(n_r_miss)} on the right matched nothing ({fate})")
+            n_null_keys = int(left[lk].isna().any(axis=1).sum())
+            if n_null_keys:
+                print(f"  ! {_rows(n_null_keys)} on the left have a null key")
+            if len(merged) > len(left) and how in ("left", "inner"):
+                print(f"  ! the right key is not unique - the join added "
+                      f"{_rows(len(merged) - len(left))}")
+            if overlap:
+                print(f"  + right columns kept under a suffix: "
+                      f"{', '.join(f'{c}{suffix}' for c in overlap)}")
+            print(f"{BOLD}-> {left.shape[0]}x{left.shape[1]} to "
+                  f"{merged.shape[0]}x{merged.shape[1]}{RESET}\n")
+
+        key_repr = lk[0] if len(lk) == 1 else lk
+        return self._derive(merged, step=f"join({how!r}, on={key_repr!r})")
+
+    @_classorinstance
+    def concat(self, *sources, source_col=None, verbose=True):
+        """Stack tables on top of each other - files, globs, Data or frames.
+
+            Data.concat("data/2024-*.csv")            # a folder of monthly files
+            Data.concat("jan.csv", "feb.csv")
+            d.concat(more)                            # onto an existing Data
+
+        ``source_col="file"`` records which source each row came from, which is
+        what you want the moment two files disagree.
+
+        Columns are matched by name; the report calls out the two things that
+        quietly ruin a stacked dataset - a column missing from one source (it
+        becomes nulls) and a column whose type differs between sources (the
+        result falls back to text). Returns a NEW ``Data``.
+        """
+        items = list(sources)
+        if len(items) == 1 and isinstance(items[0], (list, tuple)):
+            items = list(items[0])
+        # a glob only earns its keep if it matches something
+        expanded = []
+        for item in items:
+            if isinstance(item, str) and any(ch in item for ch in "*?["):
+                hits = sorted(glob.glob(item))
+                if not hits:
+                    raise ValueError(f"no files match {item!r}")
+                expanded.extend(hits)
+            else:
+                expanded.append(item)
+        if self is not None:
+            expanded.insert(0, self)
+        if not expanded:
+            raise ValueError("concat() needs at least one source")
+
+        frames, labels = [], []
+        for i, item in enumerate(expanded):
+            frames.append(Data._as_frame(item))
+            labels.append(Data._label(item, i))
+        if self is not None:
+            labels[0] = "this data"
+        if source_col:
+            frames = [f.assign(**{source_col: lab}) for f, lab in zip(frames, labels)]
+
+        cols = []
+        for f in frames:
+            cols.extend(c for c in f.columns if c not in cols)
+        out = pd.concat(frames, ignore_index=True, sort=False).reindex(columns=cols)
+
+        if verbose:
+            print(f"\n{BOLD}{UNDER}CONCAT{RESET}")
+            print(f"  + {len(frames)} sources: "
+                  f"{', '.join(f'{lab} ({_rows(len(f))})' for lab, f in zip(labels, frames))}")
+            for c in cols:
+                absent = [lab for lab, f in zip(labels, frames) if c not in f.columns]
+                if absent:
+                    print(f"  ! {c!r} is missing from {', '.join(absent)} "
+                          f"- those rows are null there")
+                kinds = {_dtype_kind(f[c]) for f in frames if c in f.columns}
+                if len(kinds) > 1:
+                    print(f"  ! {c!r} is {' / '.join(sorted(kinds))} in different "
+                          f"sources - run .clean() on the result")
+            n_dupes = int(out.duplicated().sum())
+            if n_dupes:
+                hint = "" if source_col else ", source_col='file' shows where from"
+                print(f"  ! {_rows(n_dupes)} duplicated across sources "
+                      f"- .dedupe() drops them{hint}")
+            if source_col:
+                print(f"  + tagged every row with its source in {source_col!r}")
+            print(f"{BOLD}-> {out.shape[0]}x{out.shape[1]}{RESET}\n")
+
+        step = f"concat({len(frames)} sources)"
+        if self is not None:
+            return self._derive(out, step=step)
+        return Data(df=out, steps=[step])
+
     # ----------------------------------------------------------- AGGREGATE
     def groupby(self, *cols):
         return self._derive(self.df, group=list(cols))
@@ -797,8 +1151,12 @@ class Data:
         return self._derive(self.df.corr(numeric_only=True, method=method),
                             step=f"corr({method!r})")
 
-    def plot_corr(self, title="Correlation matrix", cmap="coolwarm"):
-        """Heatmap of the numeric correlation matrix."""
+    def plot_corr(self, title="Correlation matrix", cmap="coolwarm", show=None):
+        """Heatmap of the numeric correlation matrix.
+
+        Renders inline in a notebook; ``show=True`` forces a window, and
+        ``show=False`` holds the figure for ``.savefig()``.
+        """
         fig, ax = plt.subplots(figsize=(8, 6))
         c = self.df.corr(numeric_only=True)
         im = ax.imshow(c, cmap=cmap)
@@ -808,16 +1166,21 @@ class Data:
         ax.set_yticklabels(c.columns)
         fig.colorbar(im, ax=ax)
         ax.set_title(title)
-        self._fig = fig
+        self._fig = _render(fig, show)
         return self
 
     # ----------------------------------------------------------- VISUALIZE
-    def plot(self, kind="line", x=None, y=None, title=None, **kwargs):
+    def plot(self, kind="line", x=None, y=None, title=None, show=None, **kwargs):
         """One-liner plot. kind: line|bar|hist|scatter|box|pie
 
         ``x`` and ``y`` are optional: on a two-column frame (what a grouped
         aggregate leaves you with) they are inferred, so a whole pipeline
         ends ``.mean("price", by="city").plot("bar")``.
+
+        The chart shows up where you are working - inline in a notebook, no
+        PNG round-trip. From a script or REPL, end the chain with ``.show()``
+        to open it in a window (or pass ``show=True``), or ``.savefig(path)``
+        to write it out. ``show=False`` always holds the figure back.
         """
         if x is None and y is None:
             x, y = self._infer_xy(kind)
@@ -834,7 +1197,7 @@ class Data:
             self.df.plot(kind=kind, x=x, y=y, ax=ax, **kwargs)
         if title:
             ax.set_title(title)
-        self._fig = fig
+        self._fig = _render(fig, show)
         return self
 
     def _infer_xy(self, kind):
@@ -852,13 +1215,20 @@ class Data:
         return (other[0] if other else None), num[0]
 
     def show(self):
+        """Display the current figure - or the data, if there is no figure.
+
+        In a notebook the chart renders inline, in the same cell; from a script
+        or REPL it opens in a window. On a machine with no display (CI, a
+        server) it says so and points you at ``.savefig()``.
+        """
         if self._fig is not None:
-            plt.show()
+            _render(self._fig, True)
         else:
             print(self.df)
         return self
 
     def savefig(self, path):
+        """Write the current figure to a file. For when you want the PNG."""
         if self._fig is not None:
             self._fig.savefig(path, bbox_inches="tight")
             print(f"saved plot -> {path}")
@@ -875,6 +1245,12 @@ class Data:
     def to_df(self):
         """Hand back the raw DataFrame for full pandas power."""
         return self.df
+
+    def to_fig(self):
+        """Hand back the matplotlib Figure for full matplotlib power."""
+        if self._fig is None:
+            raise RuntimeError("No figure yet. Call plot()/plot_corr() first.")
+        return self._fig
 
     def copy(self):
         """An independent copy (rarely needed - transforms already copy)."""

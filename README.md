@@ -31,6 +31,7 @@ drops you back into full pandas whenever you outgrow the wrapper.
 - [Cleaning](#cleaning)
 - [Filtering](#filtering)
 - [Transforming](#transforming)
+- [Combining tables](#combining-tables)
 - [Aggregating](#aggregating)
 - [Correlations](#correlations)
 - [Plotting](#plotting)
@@ -99,7 +100,7 @@ result = (Data("sample_sales.csv")
     .filter("units > 5 and city in ['SF', 'Chicago']")
     .groupby("city").agg("mean", "unit_price")
     .plot("bar", x="city", y="unit_price", title="Mean price by city")
-    .savefig("price_by_city.png"))
+    .show())          # the chart opens right here - no PNG to go and find
 ```
 
 The `.clean()` step alone is the part you would otherwise write by hand every
@@ -113,13 +114,13 @@ dropping the empty column, killing duplicates.
 ```python
 from dclean import Data
 
-# Load, clean, filter, aggregate, plot, save — in one chain.
+# Load, clean, filter, aggregate, plot — in one chain.
 (Data("sales.csv")
     .dropna()
     .filter("age > 18")
     .groupby("city").agg("mean", "salary")
     .plot("bar", x="city", y="salary")
-    .savefig("salary.png"))
+    .show())
 ```
 
 ---
@@ -205,7 +206,7 @@ d.median("price"); d.min("price"); d.max("price")   # whole-frame too
 straight away:
 
 ```python
-(Data("sales.csv").clean().mean("price", by="city").plot("bar").savefig("out.png"))
+(Data("sales.csv").clean().mean("price", by="city").plot("bar").show())
 ```
 
 The longhand `.groupby().agg()` still works and returns identical results —
@@ -272,17 +273,17 @@ as before, because each step passes its new object to the next:
     .filter("units > 5")
     .groupby("city").agg("mean", "unit_price")
     .plot("bar", x="city", y="unit_price")
-    .savefig("out.png"))
+    .show())
 ```
 
 The rule is simple:
 
 | Kind of method | Returns |
 |---|---|
-| Transforms — `clean` `dropna` `filter` `mutate` `agg` `to_float` … | a **new** `Data` |
+| Transforms — `clean` `dropna` `filter` `mutate` `agg` `join` `concat` … | a **new** `Data` |
 | Inspectors — `head` `report` `nulls` `describe` `log` … | the **same** object (they change nothing) |
 | Plot / output — `plot` `savefig` `to_csv` `show` | the **same** object |
-| Escape hatches — `to_df` `steps` `len` `repr` | a plain value |
+| Escape hatches — `to_df` `to_fig` `steps` `len` `repr` | a plain value |
 
 > **Upgrading from 0.1.x?** Transforms used to modify in place, so
 > `d.to_float("price")` worked as a statement. Now you must bind the result:
@@ -428,6 +429,96 @@ d.sort("price", ascending=False)
 
 ---
 
+## Combining tables
+
+### `join()` — attach another table, and see what actually matched
+
+```python
+d.join("regions.csv", on="city")                  # left join (the default)
+d.join(other, on=["city", "year"], how="inner")   # multi-column key
+d.join(other, left_on="city_id", right_on="id")   # the two sides spell it differently
+```
+
+`other` is a `Data`, a DataFrame or a path. `on` defaults to the columns the two
+tables share. `how` is `left` (default), `inner`, `right` or `outer`.
+
+**The report is the feature.** A join where one side says `"SF "` and the other
+says `"SF"` matches nothing, tells you nothing, and quietly poisons every number
+downstream. So `join()` counts what matched before it merges:
+
+```
+JOIN
+  + left join on 'city'
+  + 2 of 4 left rows matched, 2 of 5 right rows used
+  ! 2 rows on the left matched nothing (kept, with nulls): 'SF ', 'chicago'
+  ! 2 of those keys match after case/whitespace folding - .clean() both sides before joining
+  ! 3 rows on the right matched nothing (dropped)
+  + right columns kept under a suffix: notes_right
+-> 4x3 to 4x5
+```
+
+Every line there is a bug people actually ship: keys that miss, keys that would
+match after a `.clean()`, rows silently dropped by an `inner` join, and — the
+one that inflates totals without changing the row count you were watching — a
+non-unique key on the right:
+
+```
+  ! the right key is not unique - the join added 340 rows
+```
+
+A join that *cannot* work is refused up front rather than returning an empty
+frame:
+
+```python
+d.join(other, on="id")
+# ValueError: join key 'id' is text on the left but 'id' is number on the right
+# - they can never match. Make them agree first, e.g. .to_float('id')
+```
+
+Overlapping non-key columns keep their name on the left; the right-hand one
+gets a suffix (`suffix="_right"` by default). `verbose=False` skips the report —
+and the counting work with it, so a join inside a loop costs no more than
+`pd.merge`.
+
+### `concat()` — stack tables on top of each other
+
+```python
+Data.concat("data/2024-*.csv")                       # a whole folder of files
+Data.concat("jan.csv", "feb.csv", source_col="file") # tag each row with its file
+Data.concat([d1, d2, df3])                           # Data, DataFrames, paths
+d.concat(more)                                       # onto an existing Data
+```
+
+Columns are matched by name, and the report calls out the two things that
+quietly ruin a stacked dataset — a column missing from one source (it silently
+becomes nulls) and a column whose type changes between sources:
+
+```
+CONCAT
+  + 2 sources: m_2024-01.csv (1 row), m_2024-02.csv (1 row)
+  ! 'notes' is missing from m_2024-02.csv - those rows are null there
+  ! 'extra' is missing from m_2024-01.csv - those rows are null there
+  + tagged every row with its source in 'file'
+-> 2x5
+```
+
+`source_col` is worth the extra column the moment two files disagree — it is the
+difference between "some rows are wrong" and "the February export is wrong".
+
+### The whole job, end to end
+
+```python
+(Data.concat("exports/*.csv", source_col="file")   # every monthly export
+    .clean()                                       # names, types, dates, dupes
+    .join("regions.csv", on="city")                # attach the lookup table
+    .filter("units > 5")
+    .sum("revenue", by="region")
+    .plot("bar", title="Revenue by region")
+    .show())
+```
+
+---
+
 ## Aggregating
 
 Group then aggregate. `agg(how, col)` computes one statistic on one column.
@@ -471,7 +562,7 @@ print(corr_df)
 (Data("sales.csv")
     .dropna()
     .plot_corr(title="Feature correlations")
-    .savefig("corr.png"))
+    .show())
 ```
 
 `corr()` and `plot_corr()` use Pearson correlation on numeric columns only.
@@ -494,15 +585,49 @@ d.plot("box",    x="city",   y="salary")               # boxplot
 d.plot("pie",    x="city",   y="salary")               # pie chart
 ```
 
-Finish a plot with `.savefig("path.png")` (saves the figure) or `.show()`
-(opens it interactively — in notebooks this renders inline).
+### Where the chart appears
+
+The plot shows up where you are working — you never have to open a PNG to see
+what you just plotted:
+
+| Where you run it | What happens |
+|---|---|
+| Jupyter / IPython notebook | renders **inline**, in the same cell, as soon as you call `.plot()` |
+| Script or REPL | end the chain with `.show()` (or pass `show=True`) and it opens in a window |
+| No display at all (CI, a server over SSH) | `.savefig("chart.png")` writes the file; `.show()` tells you there is no display instead of silently doing nothing |
 
 ```python
+# notebook - the bar chart appears under the cell, no savefig needed
+(Data("sales.csv")
+    .dropna()
+    .groupby("city").agg("mean", "salary")
+    .plot("bar", x="city", y="salary", title="Mean salary by city"))
+
+# script - .show() opens the window
 (Data("sales.csv")
     .dropna()
     .groupby("city").agg("mean", "salary")
     .plot("bar", x="city", y="salary", title="Mean salary by city")
-    .savefig("salary_by_city.png"))
+    .show())
+
+# want the file as well? savefig still does exactly what it always did
+d.plot("bar", x="city", y="salary").savefig("salary_by_city.png")
+```
+
+`show=` overrides the automatic choice on `plot()`, `plot_corr()` and
+`nulls(plot=True)`:
+
+```python
+d.plot("bar", show=True)     # display it now, wherever I am
+d.plot("bar", show=False)    # display nothing; I only want .savefig()
+```
+
+`.to_fig()` hands back the matplotlib `Figure` — the plotting equivalent of
+`.to_df()` — for anything `dclean` doesn't wrap:
+
+```python
+fig = d.plot("bar").to_fig()
+fig.axes[0].set_ylabel("mean salary ($)")
 ```
 
 Extra matplotlib keyword arguments pass straight through:
@@ -511,8 +636,10 @@ Extra matplotlib keyword arguments pass straight through:
 d.plot("scatter", x="age", y="salary", color="red", alpha=0.5)
 ```
 
-> Note: because `dclean` sets a headless-safe matplotlib backend, `savefig`
-> always works (e.g. in scripts, CI, servers). `show()` is for interactive use.
+> Note: `dclean` does not pin a matplotlib backend, so plots render inline in
+> notebooks and in a window from a script. Matplotlib's own detection still
+> falls back to a file-only backend when there is no display, so `savefig()`
+> keeps working in scripts, CI and servers.
 
 ---
 
@@ -614,6 +741,21 @@ d.select("name", "price")
 d.sort("price")   d.sort("price", ascending=False)
 ```
 
+### Combine
+
+```python
+d.join("regions.csv", on="city")     # left join + a report of what matched
+d.join(other, on="city", how="inner")            # left/inner/right/outer
+d.join(other, on=["city", "year"])               # multi-column key
+d.join(other, left_on="city_id", right_on="id")  # differently named keys
+d.join(other, on="city", suffix="_lookup")       # rename right-hand clashes
+d.join(other, on="city", verbose=False)          # skip the report
+
+Data.concat("data/*.csv")            # stack a folder of files
+Data.concat("a.csv", "b.csv", source_col="file") # ...and record where each row came from
+d.concat(other)                      # stack onto an existing Data
+```
+
 ### Aggregate
 
 ```python
@@ -641,11 +783,13 @@ d.plot("scatter", x="age", y="salary", color="red", alpha=0.5)
 d.plot("box", x="city", y="salary")
 d.plot("pie", x="city", y="salary")
 d.plot_corr(title="Feature correlations")
-d.savefig("chart.png")               # always works (headless-safe)
-d.show()                             # interactive / inline in notebooks
+d.plot("bar", show=False)            # build the figure, display nothing
+d.show()                             # inline in a notebook, a window from a script
+d.savefig("chart.png")               # write it to a file (works headless)
 
 d.to_csv("clean.csv")
 d.to_df()                            # the raw DataFrame - full pandas
+d.to_fig()                           # the matplotlib Figure - full matplotlib
 ```
 
 ---
@@ -657,14 +801,15 @@ d.to_df()                            # the raw DataFrame - full pandas
 | **Do it all** | `dclean.clean(src, to=...)` `dclean.report(src)` `.clean([nulls])` `.report()` | one call: name the file, the library handles the rest |
 | Load file | `Data("file.csv")` | auto-detects csv/xls/xlsx/json/parquet |
 | From frame | `Data(df)` / `Data.from_records([...])` | |
-| Inspect | `.head(n)` `.tail(n)` `.print([n])` `.to_table([max_rows])` `.shape()` `.dtypes()` `.cols()` `.info()` `.describe()` `.nulls([plot])` | `print(d)` renders the dataset; `repr(d)` stays terse. `.shape()` and `.dtypes()` show per-feature types |
+| Inspect | `.head(n)` `.tail(n)` `.print([n])` `.to_table([max_rows])` `.shape()` `.dtypes()` `.cols()` `.info()` `.describe()` `.nulls([plot], [show])` | `print(d)` renders the dataset; `repr(d)` stays terse. `.shape()` and `.dtypes()` show per-feature types |
 | Clean | `.clean([nulls])` `.dropna([subset])` `.fillna(v)` `.fix_nulls([strategy])` `.drop_outliers([cols])` `.dedupe([subset])` `.drop(c)` `.keep(*c)` `.rename(a=b)` `.lower_cols()` `.astype(a="t")` `.to_float(*cols)` | `.to_float()` strips currency/separators, unparseable→NaN |
 | Filter | `.filter("expr")` | `== != > < >= <= and or in not in` + `between` |
 | Transform | `.mutate(x="expr")` `.select(*c)` `.sort(by, [ascending])` | |
+| Combine | `.join(other, [on], [how], [left_on], [right_on], [suffix])` `Data.concat(*sources, [source_col])` | reports matched/unmatched rows, near-miss keys, row multiplication, column and type mismatches |
 | Aggregate | `.mean/.sum/.count/.median/.min/.max([col], [by])` `.top(n, by)` `.bottom(n, by)` `.counts(col)` `.stat(how, col, by)` | one call, no separate `groupby` step |
 | Aggregate (longhand) | `.groupby(*c).agg(how, col)` `.summarize(**stats)` `.corr([method])` | |
-| Plot | `.plot(kind, [x], [y], [title])` `.plot_corr([title])` | line/bar/hist/scatter/box/pie; `x`/`y` inferred on a 2-column frame |
-| Output | `.savefig(path)` `.show()` `.to_csv(path)` `.to_df()` | |
+| Plot | `.plot(kind, [x], [y], [title], [show])` `.plot_corr([title], [show])` | line/bar/hist/scatter/box/pie; `x`/`y` inferred on a 2-column frame; `show=` overrides where it renders |
+| Output | `.show()` `.savefig(path)` `.to_csv(path)` `.to_df()` `.to_fig()` | `.show()`/`.plot()` render inline in notebooks, in a window from a script |
 | Provenance | `.log()` `.steps()` | what the pipeline actually did |
 
 Transform methods return a **new** `Data` (the original is untouched);
@@ -701,8 +846,9 @@ shorter.
 - **Auditable.** `.log()` replays every step the toolkit took on your behalf.
 - **Vectorized.** `filter()` and `mutate()` use `DataFrame.eval`/`query`, so
   they stay fast on large frames — no Python-row loops.
-- **Headless-safe plotting.** The matplotlib backend is set to `Agg`, so
-  `savefig()` works in scripts, CI, and servers without a display.
+- **Plots where you are.** No backend is pinned: charts render inline in a
+  notebook and in a window from a script, and fall back to `savefig()` on a
+  machine with no display — so seeing a plot never costs a file round-trip.
 - **Escape hatch.** `.to_df()` gives you the raw DataFrame for anything not
   wrapped.
 
